@@ -1,0 +1,28 @@
+[package]
+name = "nano_banana_backend"
+version = "1.0.0"
+edition = "2021"
+description = "NanoBanana Blender Addon - Rust performance backend"
+
+[[bin]]
+name = "nano_banana_backend"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = { version = "0.24", features = ["png", "jpeg", "tiff"] }
+base64 = "0.22"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.4", features = ["derive"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
