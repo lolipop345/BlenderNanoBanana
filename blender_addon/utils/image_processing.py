@@ -10,24 +10,32 @@ import base64
 from typing import Optional, Tuple
 
 
-def image_to_base64(filepath: str) -> Optional[str]:
+def image_to_base64(filepath: Optional[str]) -> Optional[str]:
     """Read an image file and return base64-encoded string."""
-    if not os.path.isfile(filepath):
+    if not filepath or not os.path.isfile(filepath):
         return None
-    with open(filepath, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+    try:
+        with open(filepath, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        print(f"[NanoBanana::ImageProcessing] Failed to encode image '{filepath}': {e}")
+        return None
 
 
 def base64_to_file(b64_data: str, output_path: str) -> bool:
     """Decode base64 image data and write to file."""
+    if not b64_data or not output_path:
+        return False
     try:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        parent = os.path.dirname(output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         data = base64.b64decode(b64_data)
         with open(output_path, "wb") as f:
             f.write(data)
         return True
     except Exception as e:
-        print(f"[NanoBanana::ImageProcessing] Failed to write image: {e}")
+        print(f"[NanaBanana::ImageProcessing] Failed to write image: {e}")
         return False
 
 

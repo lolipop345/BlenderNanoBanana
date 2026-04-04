@@ -55,6 +55,13 @@ class NANOBANANA_OT_clear_region_cache(Operator):
             return {"CANCELLED"}
 
         clear_region_cache(context, uv_region_id)
+        # Clear stale map paths that belonged to this region
+        props.last_generated_maps_json = "{}"
+        try:
+            from ..utils.preview_manager import clear as _clear_previews
+            _clear_previews()
+        except Exception:
+            pass
         self.report({"INFO"}, f"Cache cleared for region '{uv_region_id}'.")
         return {"FINISHED"}
 
@@ -72,6 +79,14 @@ class NANOBANANA_OT_clear_project_cache(Operator):
 
     def execute(self, context):
         clear_project_cache(context)
+        # Clear stale scene props
+        props = context.scene.nano_banana
+        props.last_generated_maps_json = "{}"
+        try:
+            from ..utils.preview_manager import clear as _clear_previews
+            _clear_previews()
+        except Exception:
+            pass
         self.report({"INFO"}, "Project cache cleared.")
         return {"FINISHED"}
 

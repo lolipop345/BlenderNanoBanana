@@ -1,0 +1,82 @@
+"""
+BlenderNanoBanana - Preview / Thumbnail Manager
+
+Manages a bpy.utils.previews ImagePreviewCollection for displaying
+generated texture map thumbnails in the N-tab panels and Image Editor.
+"""
+
+import os
+from typing import Dict, Optional
+
+import bpy
+
+_pcoll = None
+
+
+def get_preview_collection():
+    """Return the active preview collection, creating it if needed."""
+    global _pcoll
+    if _pcoll is None:
+        _pcoll = bpy.utils.previews.new()
+    return _pcoll
+
+
+def load_map_previews(map_paths: Dict[str, str]):
+    """
+    Load generated map images into the preview collection.
+
+    Args:
+        map_paths: {"albedo": "/path/albedo.png", "normal": "/path/normal.png", ...}
+    """
+    pcoll = get_preview_collection()
+
+    for map_name, filepath in map_paths.items():
+        if not filepath or not os.path.exists(filepath):
+            continue
+        key = f"nb_{map_name}"
+        # Remove stale entry before reloading
+        if key in pcoll:
+            del pcoll[key]
+        try:
+            pcoll.load(key, filepath, "IMAGE")
+        except Exception:
+            pass
+
+
+def get_icon_id(map_name: str) -> Optional[int]:
+    """Return the icon_value for a map name, or None if not loaded."""
+    pcoll = get_preview_collection()
+    key = f"nb_{map_name}"
+    if key in pcoll:
+        return pcoll[key].icon_id
+    return None
+
+
+def get_all_icon_ids() -> Dict[str, int]:
+    """Return {map_name: icon_id} for all loaded previews."""
+    pcoll = get_preview_collection()
+    result = {}
+    for key, preview in pcoll.items():
+        if key.startswith("nb_"):
+            map_name = key[3:]  # strip "nb_" prefix
+            result[map_name] = preview.icon_id
+    return result
+
+
+def clear():
+    """Remove all loaded previews."""
+    global _pcoll
+    if _pcoll is not None:
+        _pcoll.clear()
+
+
+def register():
+    global _pcoll
+    _pcoll = bpy.utils.previews.new()
+
+
+def unregister():
+    global _pcoll
+    if _pcoll is not None:
+        bpy.utils.previews.remove(_pcoll)
+        _pcoll = None

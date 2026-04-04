@@ -20,6 +20,7 @@ def build_gemini_context(
     engine_spec: dict,
     viewport_image_path: Optional[str] = None,
     reference_image_paths: Optional[List[str]] = None,
+    mesh_description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build the context dict sent to Gemini 3 Flash.
@@ -34,7 +35,7 @@ def build_gemini_context(
             "images": [{"mime_type": str, "data": base64_str}, ...],
         }
     """
-    system_prompt = _build_system_prompt(tag_definition, engine_spec)
+    system_prompt = _build_system_prompt(tag_definition, engine_spec, mesh_description)
     user_prompt = _build_user_prompt(tag_id, tag_definition, engine_spec)
     images = _collect_images(viewport_image_path, reference_image_paths)
 
@@ -54,7 +55,8 @@ def build_gemini_context(
     }
 
 
-def _build_system_prompt(tag_def: dict, engine_spec: dict) -> str:
+def _build_system_prompt(tag_def: dict, engine_spec: dict,
+                         mesh_description: Optional[str] = None) -> str:
     """
     System instruction for Gemini: generate compact JSON texture parameters.
     No prose, no descriptions, just structured property values.
@@ -63,7 +65,7 @@ def _build_system_prompt(tag_def: dict, engine_spec: dict) -> str:
     realism = tag_def.get("realism", "realistic")
     notes = tag_def.get("special_notes", "")
 
-    return (
+    prompt = (
         "You are a texture parameter generator. "
         "Your ONLY job is to output a valid JSON object with texture properties. "
         "Do NOT write any text before or after the JSON. "
@@ -72,9 +74,13 @@ def _build_system_prompt(tag_def: dict, engine_spec: dict) -> str:
         f"Target engine: {engine_spec.get('name', 'Unknown')}. "
         f"Material detail level: {detail}. "
         f"Realism style: {realism}. "
-        + (f"Notes: {notes}. " if notes else "")
-        + "Output JSON with these exact fields and nothing else."
     )
+    if notes:
+        prompt += f"Notes: {notes}. "
+    if mesh_description:
+        prompt += f"Mesh analysis: {mesh_description}. "
+    prompt += "Output JSON with these exact fields and nothing else."
+    return prompt
 
 
 def _build_user_prompt(tag_id: str, tag_def: dict, engine_spec: dict) -> str:

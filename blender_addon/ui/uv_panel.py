@@ -7,6 +7,8 @@ Seam marking controls, unwrap, pack, UV island browser.
 import bpy
 from bpy.types import Panel
 
+_ISLAND_PAGE_SIZE = 8
+
 
 class NANOBANANA_PT_uv(Panel):
     bl_label = "UV Mapping"
@@ -36,7 +38,7 @@ class NANOBANANA_PT_uv(Panel):
         box.label(text="Unwrap", icon="UV")
 
         col = box.column(align=True)
-        op = col.operator("nanobanana.unwrap_uv", icon="MOD_UVPROJECT")
+        col.operator("nanobanana.unwrap_uv", icon="MOD_UVPROJECT")
         col.operator("nanobanana.pack_islands", icon="FULLSCREEN_ENTER")
 
         # ── UV Islands ────────────────────────────────────────────────────────
@@ -45,31 +47,45 @@ class NANOBANANA_PT_uv(Panel):
         box.operator("nanobanana.analyze_uv_islands", text="Detect Islands", icon="VIEWZOOM")
 
         uv_data = context.scene.get("nb_uv_analysis")
-        if uv_data:
-            islands = uv_data.get("islands", [])
-            count = uv_data.get("island_count", len(islands))
-            box.label(text=f"{count} island(s) detected", icon="INFO")
-
-            props = context.scene.nano_banana
-
-            for island in islands[:8]:  # Show max 8 in panel
-                iid = island.get("id", "?")
-                area = island.get("area", 0.0)
-                is_active = (iid == props.active_uv_region_id)
-
-                row = box.row(align=True)
-                icon = "RADIOBUT_ON" if is_active else "RADIOBUT_OFF"
-                op = row.operator("wm.context_set_string",
-                                  text=f"{iid}  ({area:.3f})",
-                                  icon=icon,
-                                  depress=is_active)
-                op.data_path = "scene.nano_banana.active_uv_region_id"
-                op.value = iid
-
-            if len(islands) > 8:
-                box.label(text=f"...and {len(islands) - 8} more", icon="DOT")
-        else:
+        if not uv_data:
             box.label(text="Click 'Detect Islands' to scan", icon="DOT")
+            return
+
+        islands = uv_data.get("islands", [])
+        total = len(islands)
+        box.label(text=f"{total} island(s) detected", icon="INFO")
+
+        props = context.scene.nano_banana
+
+        # Current page (stored as a custom scene dict prop — no registration needed)
+        page = context.scene.get("_nb_island_page", 0)
+        page = max(0, min(page, (total - 1) // _ISLAND_PAGE_SIZE))
+
+        start = page * _ISLAND_PAGE_SIZE
+        end = min(start + _ISLAND_PAGE_SIZE, total)
+
+        for island in islands[start:end]:
+            iid = island.get("id", "?")
+            face_count = island.get("face_count", 0)
+            is_active = (iid == props.active_uv_region_id)
+
+            row = box.row(align=True)
+            icon = "RADIOBUT_ON" if is_active else "RADIOBUT_OFF"
+            op = row.operator("nanobanana.select_uv_island",
+                              text=f"{iid}  ({face_count}f)",
+                              icon=icon,
+                              depress=is_active)
+            op.island_id = iid
+
+        # Pagination controls
+        if total > _ISLAND_PAGE_SIZE:
+            max_page = (total - 1) // _ISLAND_PAGE_SIZE
+            nav = box.row(align=True)
+            op_prev = nav.operator("nanobanana.island_page", text="", icon="TRIA_LEFT")
+            op_prev.delta = -1
+            nav.label(text=f"{page + 1} / {max_page + 1}")
+            op_next = nav.operator("nanobanana.island_page", text="", icon="TRIA_RIGHT")
+            op_next.delta = 1
 
 
 def register():

@@ -41,15 +41,33 @@ _MODULE = "CacheManager"
 
 _DEFAULT_CACHE_SUBDIR = "nano_banana_cache"
 
+# Thread-safe override: set before spawning background thread so bpy.context
+# is never accessed from a non-main thread.
+_cache_base_override: Optional[str] = None
+_project_name_override: Optional[str] = None
 
-def get_cache_base_path(context) -> str:
+
+def set_thread_overrides(cache_base: Optional[str], project_name: Optional[str]):
+    """Set pre-computed values so background threads avoid bpy.context access."""
+    global _cache_base_override, _project_name_override
+    _cache_base_override = cache_base
+    _project_name_override = project_name
+
+
+def get_cache_base_path(context=None) -> str:
     """
     Get the root cache directory.
 
     Uses addon preferences cache_base_path if set,
     otherwise uses a subfolder next to the .blend file,
     otherwise uses the addon directory.
+
+    If set_thread_overrides() was called, returns the pre-computed value
+    without touching bpy.context (safe from background threads).
     """
+    if _cache_base_override is not None:
+        return _cache_base_override
+
     # Try preferences
     try:
         import bpy
@@ -78,8 +96,10 @@ def get_cache_base_path(context) -> str:
     return os.path.join(addon_dir, "assets", "cache")
 
 
-def get_project_name(context) -> str:
+def get_project_name(context=None) -> str:
     """Get the current project name (derived from .blend filename)."""
+    if _project_name_override is not None:
+        return _project_name_override
     try:
         import bpy
         blend_path = bpy.data.filepath

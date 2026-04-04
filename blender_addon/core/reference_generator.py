@@ -12,7 +12,7 @@ from .cache_manager import save_reference_image, get_reference_images
 from .viewport_handler import get_latest_capture
 from ..api.google_vision import generate_reference_image
 from ..utils.image_processing import image_to_base64
-from ..utils.logging import log_info, log_debug, log_error
+from ..utils.logging import log_info, log_debug, log_error, log_warning
 
 _MODULE = "ReferenceGenerator"
 
@@ -60,7 +60,7 @@ def generate_references(
         )
 
         if image_b64 is None:
-            log_error(f"Reference {i+1} generation failed.", _MODULE)
+            log_warning(f"Reference {i+1}/{count} failed — skipping.", _MODULE)
             continue
 
         saved = save_reference_image(

@@ -51,12 +51,14 @@ class APIClient:
                     return json.loads(body)
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8")
+                # Extract just the message field from JSON error body if possible
+                short_msg = _extract_error_message(body, e.code)
                 if e.code in (429, 503):
                     # Rate limit / service unavailable — retry
-                    last_error = RuntimeError(f"HTTP {e.code}: {body}")
+                    last_error = RuntimeError(short_msg)
                     time.sleep(API_RETRY_DELAY_SEC * attempt)
                     continue
-                raise RuntimeError(f"API HTTP error {e.code}: {body}")
+                raise RuntimeError(short_msg)
             except urllib.error.URLError as e:
                 last_error = RuntimeError(f"Network error: {e.reason}")
                 if attempt < API_MAX_RETRIES:
@@ -67,14 +69,20 @@ class APIClient:
 
         raise last_error or RuntimeError("API request failed after retries.")
 
-    def get_json(self, url: str, timeout: float = API_REQUEST_TIMEOUT) -> dict:
-        full_url = url if url.startswith("http") else self.base_url + url
-        headers = {"x-goog-api-key": self.api_key}
-        req = urllib.request.Request(full_url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"HTTP error {e.code}: {e.read().decode('utf-8')}")
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"Network error: {e.reason}")
+
+def _extract_error_message(body: str, code: int) -> str:
+    """
+    Return a short, viewport-friendly error string from an API error body.
+    Extracts the 'message' field from JSON if available, otherwise truncates raw body.
+    """
+    try:
+        data = json.loads(body)
+        msg = data.get("error", {}).get("message") or data.get("message", "")
+        if msg:
+            # Truncate at first period or 120 chars
+            short = msg.split(".")[0][:120]
+            return f"API {code}: {short}"
+    except Exception:
+        pass
+    # Fallback: raw body truncated
+    return f"API {code}: {body[:100]}"

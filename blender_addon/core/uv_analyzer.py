@@ -1,15 +1,13 @@
 """
 BlenderNanoBanana - UV Island Analyzer
 
-Detects UV islands and their properties via Rust backend.
-Falls back to Blender's built-in UV data if Rust is unavailable.
+Detects UV islands via bmesh flood-fill (seam-boundary connected components).
+Each group of faces connected by non-seam edges is one UV island.
 """
 
-import os
-from typing import Optional, List, Dict, Any
+import bmesh
+from typing import Optional, Dict, Any
 
-from ..utils.mesh_utils import get_active_mesh_data
-from ..utils.geometry import uv_bounding_box, uv_area, uv_center
 from ..utils.logging import log_info, log_debug, log_error
 
 _MODULE = "UVAnalyzer"
@@ -17,7 +15,9 @@ _MODULE = "UVAnalyzer"
 
 def analyze_uv_islands(context) -> Optional[Dict[str, Any]]:
     """
-    Detect UV islands for the active mesh.
+    Detect UV islands for the active mesh using bmesh flood-fill.
+
+    Two faces belong to the same island if they share an edge that is NOT a seam.
 
     Returns:
         {
@@ -28,7 +28,8 @@ def analyze_uv_islands(context) -> Optional[Dict[str, Any]]:
                     "center": [u, v],
                     "bounds": {"min": [u,v], "max": [u,v]},
                     "face_count": int,
-                    "symmetrical_to": str | None,
+                    "face_indices": [int, ...],
+                    "symmetrical_to": None,
                 }
             ],
             "total_uv_area": float,
@@ -36,52 +37,85 @@ def analyze_uv_islands(context) -> Optional[Dict[str, Any]]:
         }
         or None if no mesh / UV data.
     """
-    mesh_data = get_active_mesh_data(context)
-    if mesh_data is None or not mesh_data.get("uv_coords"):
-        log_debug("No UV data found on active mesh.", _MODULE)
+    obj = context.active_object
+    if obj is None or obj.type != "MESH":
         return None
 
-    # Try Rust
-    try:
-        from .rust_bridge import get_rust_bridge
-        bridge = get_rust_bridge()
-        if bridge.is_running():
-            result = bridge.analyze_uv_islands(
-                uv_coordinates=mesh_data["uv_coords"],
-                seams=mesh_data["seams"],
-            )
-            log_debug(f"Rust UV analysis: {result.get('island_count', '?')} islands", _MODULE)
-            return result
-    except Exception as e:
-        log_error(f"Rust UV analysis failed, using fallback: {e}", _MODULE, e)
-
-    # Python fallback: treat entire UV map as one island
-    return _python_uv_fallback(mesh_data)
+    return _detect_islands_bmesh(obj)
 
 
-def _python_uv_fallback(mesh_data: dict) -> dict:
-    """Simple Python fallback: one island per mesh."""
-    uv_coords = mesh_data["uv_coords"]
-    if not uv_coords:
+def _detect_islands_bmesh(obj) -> Dict[str, Any]:
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        bm.free()
+        log_debug("No active UV layer on mesh.", _MODULE)
         return {"islands": [], "total_uv_area": 0.0, "island_count": 0}
 
-    min_u, min_v, max_u, max_v = uv_bounding_box(uv_coords)
-    center = uv_center(uv_coords)
-    island_id = f"uv_{mesh_data.get('object_name', 'obj')}_001"
+    visited = set()
+    islands = []
 
-    island = {
-        "id": island_id,
-        "area": (max_u - min_u) * (max_v - min_v),
-        "center": list(center),
-        "bounds": {"min": [min_u, min_v], "max": [max_u, max_v]},
-        "face_count": mesh_data["face_count"],
-        "symmetrical_to": None,
-    }
+    for start_face in bm.faces:
+        if start_face.index in visited:
+            continue
 
+        # BFS: expand through non-seam edges
+        island_indices = []
+        queue = [start_face]
+        visited.add(start_face.index)
+
+        while queue:
+            face = queue.pop()
+            island_indices.append(face.index)
+            for edge in face.edges:
+                if edge.seam:
+                    continue
+                for linked_face in edge.link_faces:
+                    if linked_face.index not in visited:
+                        visited.add(linked_face.index)
+                        queue.append(linked_face)
+
+        # Compute UV bounding box for this island
+        uvs = []
+        for fi in island_indices:
+            for loop in bm.faces[fi].loops:
+                uvs.append(loop[uv_layer].uv.copy())
+
+        if uvs:
+            min_u = min(u.x for u in uvs)
+            max_u = max(u.x for u in uvs)
+            min_v = min(u.y for u in uvs)
+            max_v = max(u.y for u in uvs)
+            area = (max_u - min_u) * (max_v - min_v)
+            center = [(min_u + max_u) / 2, (min_v + max_v) / 2]
+        else:
+            min_u = min_v = max_u = max_v = 0.0
+            area = 0.0
+            center = [0.0, 0.0]
+
+        islands.append({
+            "id": f"uv_{len(islands) + 1:03d}",
+            "area": area,
+            "center": center,
+            "bounds": {"min": [min_u, min_v], "max": [max_u, max_v]},
+            "face_count": len(island_indices),
+            "face_indices": island_indices,
+            "symmetrical_to": None,
+        })
+
+    bm.free()
+
+    total_area = sum(i["area"] for i in islands)
+    log_info(f"Detected {len(islands)} UV islands via bmesh flood-fill.", _MODULE)
     return {
-        "islands": [island],
-        "total_uv_area": island["area"],
-        "island_count": 1,
+        "islands": islands,
+        "total_uv_area": total_area,
+        "island_count": len(islands),
     }
 
 

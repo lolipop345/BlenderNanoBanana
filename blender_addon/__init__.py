@@ -8,7 +8,7 @@ Rust backend handles performance-critical operations (10x speedup).
 
 bl_info = {
     "name": "Nano Banana",
-    "author": "NanoBanana Team",
+    "author": "lolipop345",
     "version": (1, 0, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Nano Banana",
@@ -70,6 +70,7 @@ def _register_modules():
         reference_ops,
         texture_ops,
         cache_ops,
+        seam_tag_ops,
     )
     from .ui import (
         main_panel,
@@ -79,7 +80,11 @@ def _register_modules():
         texture_panel,
         cache_panel,
         viewport_overlay,
+        image_editor_panel,
     )
+    from .core import uv_seam_overlay
+    from .utils import preview_manager
+
     modules = [
         preferences,
         install_ops,
@@ -90,6 +95,7 @@ def _register_modules():
         reference_ops,
         texture_ops,
         cache_ops,
+        seam_tag_ops,
         main_panel,
         model_panel,
         uv_panel,
@@ -97,6 +103,9 @@ def _register_modules():
         texture_panel,
         cache_panel,
         viewport_overlay,
+        image_editor_panel,
+        uv_seam_overlay,
+        preview_manager,
     ]
     return modules
 
@@ -113,6 +122,7 @@ def _unregister_modules():
         reference_ops,
         texture_ops,
         cache_ops,
+        seam_tag_ops,
     )
     from .ui import (
         main_panel,
@@ -122,9 +132,15 @@ def _unregister_modules():
         texture_panel,
         cache_panel,
         viewport_overlay,
+        image_editor_panel,
     )
+    from .core import uv_seam_overlay
+    from .utils import preview_manager
 
     return [
+        preview_manager,
+        uv_seam_overlay,
+        image_editor_panel,
         viewport_overlay,
         cache_panel,
         texture_panel,
@@ -132,6 +148,7 @@ def _unregister_modules():
         uv_panel,
         model_panel,
         main_panel,
+        seam_tag_ops,
         cache_ops,
         texture_ops,
         reference_ops,
@@ -212,7 +229,7 @@ class NanoBananaSceneProps(bpy.types.PropertyGroup):
     # Viewport overlay toggle
     show_uv_overlay: BoolProperty(
         name="Show UV Overlay",
-        description="Show UV island highlights in viewport",
+        description="Show UV island highlights in viewport and UV editor tag overlay",
         default=True,
     )
 
@@ -220,6 +237,20 @@ class NanoBananaSceneProps(bpy.types.PropertyGroup):
         name="Show Tag Labels",
         description="Show semantic tag labels on UV islands",
         default=True,
+    )
+
+    # Seam edge tag data — JSON: {"MeshName": {"42": "tag_id", ...}}
+    seam_tags_json: StringProperty(
+        name="Seam Tags",
+        description="Edge-level semantic tag assignments (JSON)",
+        default="{}",
+    )
+
+    # Last generated maps — JSON: {"albedo": "/path/...", "normal": "/path/..."}
+    last_generated_maps_json: StringProperty(
+        name="Last Generated Maps",
+        description="File paths of the most recently generated texture maps (JSON)",
+        default="{}",
     )
 
 
@@ -284,6 +315,19 @@ def register():
 
     # Auto-start Rust backend
     _start_rust_backend()
+
+    # Reset all session-only state that shouldn't persist across addon reloads
+    try:
+        import bpy as _bpy
+        for scene in _bpy.data.scenes:
+            props = getattr(scene, "nano_banana", None)
+            if props is not None:
+                props.last_generated_maps_json = "{}"
+                props.is_generating = False
+                props.generation_progress = 0.0
+                props.generation_status = "Ready"
+    except Exception:
+        pass
 
     print("[NanoBanana] Addon registered successfully.")
 

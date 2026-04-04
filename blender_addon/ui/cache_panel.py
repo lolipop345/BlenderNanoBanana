@@ -42,7 +42,9 @@ class NANOBANANA_PT_cache(Panel):
             ref_box.label(text="Reference Images", icon="IMAGE_REFERENCE")
 
             refs = get_reference_images(context, uv_region_id)
-            if refs:
+            if props.is_generating:
+                ref_box.label(text="Generating...", icon="TIME")
+            elif refs:
                 ref_box.label(text=f"{len(refs)} cached", icon="CHECKMARK")
                 for path in refs[-3:]:  # Show last 3
                     row = ref_box.row()
@@ -51,8 +53,11 @@ class NANOBANANA_PT_cache(Panel):
                                  text="Browse All", icon="FILEBROWSER")
             else:
                 ref_box.label(text="No references cached", icon="X")
-            ref_box.operator("nanobanana.generate_references",
-                             text="Generate References", icon="RENDER_STILL")
+
+            row = ref_box.row()
+            row.enabled = not props.is_generating
+            row.operator("nanobanana.generate_references",
+                         text="Generate References", icon="RENDER_STILL")
 
             # Textures
             tex_box = layout.box()

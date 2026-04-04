@@ -10,11 +10,65 @@ import hashlib
 from typing import Optional, Dict, Any, List
 
 from .semantic_adapter import build_gemini_context
-from ..api.google_llm import generate_texture_spec
+from ..api.google_llm import generate_texture_spec, generate_text
 from ..utils.serialization import load_json, save_json
 from ..utils.logging import log_info, log_debug, log_error
 
 _MODULE = "PromptEngineer"
+
+
+def get_mesh_description(
+    api_key: str,
+    viewport_image_path: Optional[str] = None,
+    uv_layout_path: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Ask Gemini 3 Flash to describe the mesh surface visible in the viewport
+    and/or UV layout. Used as additional context for texture spec generation.
+
+    Args:
+        api_key: Google API key
+        viewport_image_path: Path to 3D viewport screenshot
+        uv_layout_path: Path to exported UV layout PNG
+
+    Returns:
+        Short English description of the mesh, or None on failure.
+    """
+    import base64, os
+
+    images = []
+    for path in [uv_layout_path, viewport_image_path]:
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode("utf-8")
+                mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+                images.append({"mime_type": mime, "data": data})
+            except Exception:
+                pass
+
+    system = (
+        "You are a 3D asset analyst. "
+        "Given a viewport screenshot and/or a UV layout image of a mesh, "
+        "describe in 1–3 concise sentences what kind of 3D object it is, "
+        "its apparent surface material, and any notable UV structure. "
+        "Be factual and brief. No markdown."
+    )
+    user = (
+        "Analyse the attached image(s) and describe this 3D mesh. "
+        "Focus on: object type, surface appearance, UV layout complexity."
+    )
+
+    description = generate_text(
+        api_key=api_key,
+        system_prompt=system,
+        user_prompt=user,
+        images=images if images else None,
+        timeout=20.0,
+    )
+    if description:
+        log_info(f"Mesh description: {description[:120]}", _MODULE)
+    return description
 
 
 def get_texture_spec(
@@ -27,6 +81,7 @@ def get_texture_spec(
     viewport_image_path: Optional[str] = None,
     reference_image_paths: Optional[List[str]] = None,
     force_regenerate: bool = False,
+    mesh_description: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Get a texture spec JSON for a UV region.
@@ -63,6 +118,7 @@ def get_texture_spec(
         engine_spec=engine_spec,
         viewport_image_path=viewport_image_path,
         reference_image_paths=reference_image_paths,
+        mesh_description=mesh_description,
     )
 
     log_info(f"Calling Gemini 3 Flash for tag='{tag_id}', engine='{engine_spec.get('id')}'...", _MODULE)

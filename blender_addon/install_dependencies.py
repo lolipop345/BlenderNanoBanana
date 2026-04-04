@@ -23,10 +23,8 @@ from typing import List, Tuple
 # min_version   = minimum acceptable version (empty = any)
 
 REQUIRED_PACKAGES: List[Tuple[str, str, str]] = [
-    ("google.generativeai", "google-generativeai", "0.8.0"),
-    ("PIL",                 "Pillow",               "10.0.0"),
-    ("requests",            "requests",             "2.31.0"),
-    ("numpy",               "numpy",                "1.24.0"),
+    ("PIL",   "Pillow", "10.0.0"),
+    ("numpy", "numpy",  "1.24.0"),
 ]
 
 

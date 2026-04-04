@@ -5,18 +5,15 @@ All magic numbers, enums, and settings live here.
 
 # ─── API Settings ─────────────────────────────────────────────────────────────
 
-# Gemini 3 Flash - JSON Spec Generator
-GEMINI_MODEL_ID = "gemini-3-flash"
+# Gemini 3 Flash - JSON Spec Generator (text)
+GEMINI_MODEL_ID = "gemini-3-flash-preview"
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
-GEMINI_TEMPERATURE = 0.3
-GEMINI_TOP_P = 0.9
-GEMINI_MAX_OUTPUT_TOKENS = 512
 
-# Nano Banana - Vision / Texture Generation
-NANO_BANANA_API_URL = ""  # User sets this in preferences
-NANO_BANANA_TIMEOUT = 120
-NANO_BANANA_RETRY_COUNT = 3
-NANO_BANANA_RETRY_DELAY = 2.0  # seconds
+# Gemini 3.1 Flash Image - Texture / Reference Image Generator
+GEMINI_IMAGE_MODEL_ID = "gemini-3.1-flash-image-preview"
+GEMINI_IMAGE_TIMEOUT = 300      # seconds — image generation can take 3-5 min
+GEMINI_IMAGE_RETRY_COUNT = 2    # fewer retries since each attempt is slow
+GEMINI_IMAGE_RETRY_DELAY = 2.0  # seconds
 
 # General API
 API_REQUEST_TIMEOUT = 60.0      # seconds
@@ -80,6 +77,26 @@ TEXTURE_THUMBNAIL_SIZE = 128
 TEXTURE_FORMATS = ["png", "exr", "jpg"]
 TEXTURE_FORMAT_DEFAULT_COLOR = "png"     # For albedo (sRGB)
 TEXTURE_FORMAT_DEFAULT_DATA = "exr"      # For normal/roughness/metallic
+
+# ─── Seam Tag Colors ──────────────────────────────────────────────────────────
+# Known tag keywords → fixed RGBA color. Unknown tags get hash-based color at runtime.
+
+SEAM_TAG_COLORS = {
+    "metallic":  (1.0, 0.80, 0.00, 1.0),  # gold
+    "metal":     (1.0, 0.80, 0.00, 1.0),  # gold
+    "fabric":    (0.3, 0.50, 1.00, 1.0),  # blue
+    "cloth":     (0.3, 0.50, 1.00, 1.0),  # blue
+    "skin":      (1.0, 0.50, 0.50, 1.0),  # pink
+    "wood":      (0.6, 0.30, 0.10, 1.0),  # brown
+    "stone":     (0.6, 0.60, 0.60, 1.0),  # grey
+    "rock":      (0.6, 0.60, 0.60, 1.0),  # grey
+    "glass":     (0.5, 0.90, 1.00, 1.0),  # light cyan
+    "plastic":   (0.9, 0.30, 0.90, 1.0),  # purple
+    "rubber":    (0.2, 0.20, 0.20, 1.0),  # dark
+    "leather":   (0.5, 0.25, 0.05, 1.0),  # dark brown
+    "emission":  (1.0, 1.00, 0.20, 1.0),  # bright yellow
+    "emissive":  (1.0, 1.00, 0.20, 1.0),  # bright yellow
+}
 
 # ─── Naming Conventions ───────────────────────────────────────────────────────
 

@@ -76,6 +76,17 @@ class NanoBananaPreferences(AddonPreferences):
 
     # ── Rust Backend ──────────────────────────────────────────────────────────
 
+    def _on_rust_path_update(self, context):
+        """Stop the Rust backend when the binary path changes."""
+        try:
+            from .core.rust_bridge import get_rust_bridge
+            bridge = get_rust_bridge()
+            if bridge.is_running():
+                bridge.stop()
+                print("[NanoBanana] Rust backend stopped (binary path changed).")
+        except Exception:
+            pass
+
     rust_binary_path: StringProperty(
         name="Rust Backend Path",
         description=(
@@ -84,6 +95,7 @@ class NanoBananaPreferences(AddonPreferences):
         ),
         subtype="FILE_PATH",
         default="",
+        update=_on_rust_path_update,
     )
 
     # ── Debug Settings ────────────────────────────────────────────────────────
@@ -164,13 +176,20 @@ class NanoBananaPreferences(AddonPreferences):
         # Rust backend status
         from .core.rust_bridge import get_rust_bridge
         bridge = get_rust_bridge()
-        if bridge and bridge.is_running():
-            row = box.row()
+        running = bridge and bridge.is_running()
+
+        row = box.row()
+        if running:
             row.label(text="Rust Backend: Running", icon="CHECKMARK")
         else:
-            row = box.row()
             row.label(text="Rust Backend: Not started", icon="X")
-            row.operator("nanobanana.start_rust_backend", text="Start Backend")
+
+        row2 = box.row(align=True)
+        row2.operator("nanobanana.start_rust_backend",
+                      text="Start Backend", icon="PLAY")
+        stop = row2.operator("nanobanana.stop_rust_backend",
+                             text="Stop Backend", icon="SNAP_FACE")
+        row2.enabled = True  # always show both buttons
 
 
 def get_preferences(context=None) -> NanoBananaPreferences:

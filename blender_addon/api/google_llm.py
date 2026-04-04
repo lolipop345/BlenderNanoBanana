@@ -16,6 +16,7 @@ from ..config.constants import (
     GEMINI_API_BASE_URL,
     GEMINI_TEXTURE_SPEC_SCHEMA,
 )
+
 from ..utils.logging import log_info, log_debug, log_error
 
 _MODULE = "GeminiLLM"
@@ -63,6 +64,58 @@ def generate_texture_spec(
         return None
 
 
+def generate_text(
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    images: Optional[List[Dict[str, str]]] = None,
+    timeout: float = 30.0,
+) -> Optional[str]:
+    """
+    Call Gemini 3 Flash and return a plain-text response (no JSON schema).
+
+    Args:
+        api_key: Google API key
+        system_prompt: System instruction
+        user_prompt: User message
+        images: Optional list of {"mime_type": str, "data": base64_str}
+        timeout: Request timeout in seconds
+
+    Returns:
+        Response text string, or None on failure.
+    """
+    client = APIClient(api_key=api_key, base_url=GEMINI_API_BASE_URL)
+    endpoint = _ENDPOINT_TEMPLATE.format(model=GEMINI_MODEL_ID)
+
+    parts = [{"text": user_prompt}]
+    if images:
+        for img in images:
+            parts.append({
+                "inline_data": {
+                    "mime_type": img["mime_type"],
+                    "data": img["data"],
+                }
+            })
+
+    payload = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": parts}],
+    }
+
+    log_debug(f"Calling Gemini 3 Flash (text, {GEMINI_MODEL_ID})...", _MODULE)
+
+    try:
+        response = client.post_json(endpoint, payload, timeout=timeout)
+        candidates = response.get("candidates", [])
+        if not candidates:
+            return None
+        parts_resp = candidates[0].get("content", {}).get("parts", [])
+        return parts_resp[0].get("text", "") if parts_resp else None
+    except Exception as e:
+        log_error(f"Gemini text call failed: {e}", _MODULE, e)
+        return None
+
+
 def _build_payload(system_prompt: str, user_prompt: str,
                    images: Optional[List[Dict[str, str]]]) -> dict:
     """Build the Gemini API request payload with structured output config."""
@@ -93,8 +146,8 @@ def _build_payload(system_prompt: str, user_prompt: str,
             # Force JSON output — no prose, no markdown
             "response_mime_type": "application/json",
             "response_schema": GEMINI_TEXTURE_SPEC_SCHEMA,
-            "temperature": 0.3,    # Low temperature = more consistent output
-            "maxOutputTokens": 512,
+            # temperature intentionally omitted — Gemini 3 docs strongly recommend
+            # keeping it at the default (1.0); lowering it causes looping/degraded output
         },
     }
 

@@ -18,6 +18,7 @@ from typing import List, Tuple
 _MAX_MESSAGES = 6
 _FADE_AFTER = 8.0       # seconds before message fades out
 _REMOVE_AFTER = 12.0    # seconds before message is removed
+_MAX_BOX_WIDTH = 420    # max pixel width of the log box
 
 # Each entry: (timestamp, level, text)
 # level: "INFO" | "WARN" | "ERROR" | "OK"
@@ -89,15 +90,34 @@ def _draw_callback():
 
     blf.size(font_id, font_size)
 
-    # Measure max text width
-    max_w = 0
-    for level, text, _ in visible:
+    # Truncate lines that exceed max box width
+    max_content_w = _MAX_BOX_WIDTH - padding_x * 2 - 4
+    truncated = []
+    for level, text, alpha in visible:
         line = f"{_ICONS.get(level, '•')}  {text}"
+        w, _ = blf.dimensions(font_id, line)
+        if w > max_content_w:
+            # Binary-search for the longest substring that fits with "…"
+            lo, hi = 0, len(line)
+            while lo < hi - 1:
+                mid = (lo + hi) // 2
+                tw, _ = blf.dimensions(font_id, line[:mid] + "…")
+                if tw <= max_content_w:
+                    lo = mid
+                else:
+                    hi = mid
+            line = line[:lo] + "…"
+        truncated.append((level, line, alpha))
+    visible = truncated
+
+    # Measure max text width (now guaranteed to fit)
+    max_w = 0
+    for _, line, _ in visible:
         w, _ = blf.dimensions(font_id, line)
         if w > max_w:
             max_w = w
 
-    box_w = max_w + padding_x * 2
+    box_w = min(max_w + padding_x * 2, _MAX_BOX_WIDTH)
     box_h = len(visible) * line_height + padding_y * 2
 
     x0 = region.width - box_w - margin_right
@@ -125,8 +145,7 @@ def _draw_callback():
     gpu.state.blend_set("NONE")
 
     # Draw text lines (newest at top)
-    for i, (level, text, alpha) in enumerate(reversed(visible)):
-        line = f"{_ICONS.get(level, '•')}  {text}"
+    for i, (level, line, alpha) in enumerate(reversed(visible)):
         r, g, b, a = _COLORS.get(level, (1, 1, 1, 1))
 
         text_x = x0 + padding_x + 4

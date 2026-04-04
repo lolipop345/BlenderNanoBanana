@@ -130,6 +130,34 @@ class NANOBANANA_PT_texture(Panel):
         layout.operator("nanobanana.apply_cached_material",
                         text="Apply Cached Material", icon="MATERIAL")
 
+        # ── Generated Map Previews ─────────────────────────────────────────────
+        import json as _json
+        import os as _os
+        try:
+            last_maps = _json.loads(getattr(props, "last_generated_maps_json", "{}") or "{}")
+        except Exception:
+            last_maps = {}
+
+        # Only show maps whose files actually exist on disk
+        last_maps = {k: v for k, v in last_maps.items() if v and _os.path.isfile(v)}
+
+        if last_maps:
+            layout.separator()
+            box = layout.box()
+            box.label(text="Generated Maps", icon="IMAGE_DATA")
+
+            from ..utils.preview_manager import get_icon_id
+            grid = box.grid_flow(row_major=True, columns=2,
+                                 even_columns=True, even_rows=True)
+            for map_name in last_maps:
+                icon_id = get_icon_id(map_name)
+                col = grid.column(align=True)
+                if icon_id:
+                    col.template_icon(icon_value=icon_id, scale=4.0)
+                else:
+                    col.label(text=map_name, icon="IMAGE_DATA")
+                col.label(text=map_name.capitalize())
+
 
 def register():
     bpy.utils.register_class(NANOBANANA_PT_texture)

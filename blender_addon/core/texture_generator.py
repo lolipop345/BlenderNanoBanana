@@ -1,23 +1,24 @@
 """
 BlenderNanoBanana - Texture Generation Orchestrator
 
-Full pipeline:
-  1. Get semantic tag + engine preset
-  2. Call Gemini 3 Flash → JSON texture spec
-  3. Send JSON spec + visual context to Nano Banana → texture images
-  4. Process images via Rust backend (optimize, color space, resize)
-  5. Save to cache
-  6. Auto-create Blender material
+Pipeline:
+  1. Load tag + engine preset
+  2. Viewport screenshot + UV layout (pre-computed on main thread)
+  3. AI mesh auto-describe (Gemini 3 Flash text call, optional)
+  4. Gemini 3 Flash → JSON texture spec
+  5. Gemini Image API → texture images (UV layout + viewport as visual context)
+  6. Process via Rust backend
+  7. Save to cache
 
-This is the main generation entry point called by texture_ops.py operator.
+Reference image generation has been removed — UV layout + viewport gives the
+AI everything it needs to generate accurate textures.
 """
 
 import os
-import time
+import threading
 from typing import Optional, Dict, Any, List, Callable
 
-from .prompt_engineer import get_texture_spec
-from .reference_generator import get_or_generate_references
+from .prompt_engineer import get_texture_spec, get_mesh_description
 from .cache_manager import (
     save_texture_version,
     get_cache_base_path,
@@ -27,11 +28,18 @@ from .viewport_handler import get_latest_capture
 from .semantic_manager import get_tag
 from ..api.google_vision import generate_textures
 from ..utils.image_processing import base64_to_file, image_to_base64
-from ..utils.mesh_utils import create_pbr_material, apply_material_to_object
 from ..utils.logging import log_info, log_debug, log_error
 from ..config.engine_presets import ENGINE_PRESETS
 
 _MODULE = "TextureGenerator"
+
+# Cancel flag — set by cancel operator, cleared at pipeline start
+_cancel_flag = threading.Event()
+
+
+def request_cancel():
+    """Signal the running pipeline to stop at the next checkpoint."""
+    _cancel_flag.set()
 
 
 def run_generation_pipeline(
@@ -42,35 +50,34 @@ def run_generation_pipeline(
     engine_id: str,
     enabled_maps: List[str],
     progress_cb: Optional[Callable[[float, str], None]] = None,
-    auto_generate_refs: bool = True,
     force_new_spec: bool = False,
+    viewport_path: Optional[str] = None,
+    uv_layout_path: Optional[str] = None,
 ) -> Optional[Dict[str, str]]:
     """
-    Run the full texture generation pipeline for a UV region.
+    Run the texture generation pipeline.
 
-    Args:
-        context: Blender context
-        api_key: Google API key
-        uv_region_id: UV island identifier
-        tag_id: Semantic tag (e.g. "human_face")
-        engine_id: Engine preset (e.g. "unity")
-        enabled_maps: List of map names to generate (e.g. ["albedo", "normal"])
-        progress_cb: Optional callback(fraction: float, message: str)
-        auto_generate_refs: Generate references before texture gen if none exist
-        force_new_spec: Force Gemini to regenerate spec (skip cache)
-
-    Returns:
-        Dict of map_name → saved file path, or None on failure.
+    Returns dict of map_name → saved file path, or None on failure/cancel.
     """
+    _cancel_flag.clear()
+
     def _progress(frac: float, msg: str):
         log_debug(f"[{frac:.0%}] {msg}", _MODULE)
         if progress_cb:
             progress_cb(frac, msg)
 
+    def _cancelled() -> bool:
+        if _cancel_flag.is_set():
+            _progress(0.0, "Cancelled.")
+            return True
+        return False
+
     project_name = get_project_name(context)
 
-    # ── Step 1: Load tag and engine ────────────────────────────────────────────
-    _progress(0.0, "Loading semantic tag and engine preset...")
+    # ── Step 1: Load tag and engine ───────────────────────────────────────────
+    _progress(0.0, "Loading tag and engine preset...")
+    if _cancelled():
+        return None
 
     tag_def = get_tag(tag_id)
     if tag_def is None:
@@ -82,30 +89,38 @@ def run_generation_pipeline(
         log_error(f"Unknown engine preset: '{engine_id}'", _MODULE)
         return None
 
-    # Mark which maps are enabled (override preset)
     engine_spec = _apply_enabled_maps(engine_spec, enabled_maps)
 
-    # ── Step 2: Get viewport screenshot ───────────────────────────────────────
-    _progress(0.05, "Loading viewport context...")
-    viewport_path = get_latest_capture(context, project_name)
+    # ── Step 2: Load visual context ───────────────────────────────────────────
+    _progress(0.05, "Loading visual context...")
+    if _cancelled():
+        return None
+
+    if viewport_path is None:
+        viewport_path = get_latest_capture(context, project_name)
     viewport_b64 = image_to_base64(viewport_path) if viewport_path else None
+    uv_layout_b64 = image_to_base64(uv_layout_path) if uv_layout_path else None
 
-    # ── Step 3: Generate / retrieve reference images ──────────────────────────
-    _progress(0.1, "Checking reference images...")
-    ref_paths = []
-    if auto_generate_refs:
-        ref_paths = get_or_generate_references(
-            context=context,
+    # ── Step 3: AI mesh auto-description ─────────────────────────────────────
+    _progress(0.08, "AI analysing mesh...")
+    if _cancelled():
+        return None
+
+    mesh_description = None
+    try:
+        mesh_description = get_mesh_description(
             api_key=api_key,
-            uv_region_id=uv_region_id,
-            tag_definition=tag_def,
-            project_name=project_name,
+            viewport_image_path=viewport_path,
+            uv_layout_path=uv_layout_path,
         )
-    ref_b64_list = [image_to_base64(p) for p in ref_paths if p]
-    ref_b64_list = [b for b in ref_b64_list if b]
+    except Exception as e:
+        log_debug(f"Mesh description skipped: {e}", _MODULE)
 
-    # ── Step 4: Gemini 3 Flash → JSON spec ────────────────────────────────────
-    _progress(0.2, "Calling Gemini 3 Flash for texture spec...")
+    if _cancelled():
+        return None
+
+    # ── Step 4: Gemini 3 Flash → JSON spec ───────────────────────────────────
+    _progress(0.15, "Generating texture spec...")
 
     spec = get_texture_spec(
         context=context,
@@ -115,18 +130,22 @@ def run_generation_pipeline(
         engine_spec=engine_spec,
         project_name=project_name,
         viewport_image_path=viewport_path,
-        reference_image_paths=ref_paths,
+        reference_image_paths=[],
         force_regenerate=force_new_spec,
+        mesh_description=mesh_description,
     )
 
     if spec is None:
         log_error("Gemini spec generation failed.", _MODULE)
         return None
 
+    if _cancelled():
+        return None
+
     log_info(f"Texture spec: {spec}", _MODULE)
 
-    # ── Step 5: Nano Banana → texture images ──────────────────────────────────
-    _progress(0.4, f"Generating {len(enabled_maps)} texture maps via Nano Banana...")
+    # ── Step 5: Gemini Image API → texture maps ───────────────────────────────
+    _progress(0.3, f"Generating {len(enabled_maps)} map(s)...")
 
     engine_map_specs = {
         name: {
@@ -138,10 +157,15 @@ def run_generation_pipeline(
         if name in enabled_maps
     }
 
+    # Build visual context: UV layout first, then viewport
     visual_context = []
+    if uv_layout_b64:
+        visual_context.append(uv_layout_b64)
     if viewport_b64:
         visual_context.append(viewport_b64)
-    visual_context.extend(ref_b64_list)
+
+    def _map_progress(frac: float, msg: str):
+        _progress(0.3 + frac * 0.5, msg)
 
     api_response = generate_textures(
         api_key=api_key,
@@ -149,14 +173,21 @@ def run_generation_pipeline(
         maps_to_generate=enabled_maps,
         engine_specs=engine_map_specs,
         visual_context_b64=visual_context if visual_context else None,
+        progress_cb=_map_progress,
+        cancel_flag=_cancel_flag,
     )
 
-    if api_response is None:
-        log_error("Nano Banana texture generation failed.", _MODULE)
+    if _cancelled():
         return None
 
-    # ── Step 6: Process textures via Rust backend ──────────────────────────────
-    _progress(0.7, "Processing textures with Rust backend...")
+    if api_response is None:
+        log_error("Texture generation failed.", _MODULE)
+        return None
+
+    # ── Step 6: Process via Rust backend ─────────────────────────────────────
+    _progress(0.82, "Processing textures...")
+    if _cancelled():
+        return None
 
     maps_response = api_response.get("maps", {})
     processed_files = _process_and_save_maps(
@@ -172,9 +203,9 @@ def run_generation_pipeline(
         return None
 
     # ── Step 7: Save to cache ─────────────────────────────────────────────────
-    _progress(0.85, "Saving to cache...")
+    _progress(0.95, "Saving to cache...")
 
-    version_dir = save_texture_version(
+    save_texture_version(
         context=context,
         uv_region_id=uv_region_id,
         texture_files=processed_files,
@@ -186,24 +217,12 @@ def run_generation_pipeline(
         },
     )
 
-    # ── Step 8: Create Blender material ──────────────────────────────────────
-    _progress(0.92, "Creating Blender material...")
-
-    mat_name = f"NB_{uv_region_id}_{tag_id}_{engine_id}"
-    mat = create_pbr_material(mat_name, processed_files)
-
-    obj = context.active_object
-    if obj:
-        apply_material_to_object(context, obj, mat)
-
-    _progress(1.0, f"Done! Generated {len(processed_files)} maps.")
+    _progress(1.0, f"Done! {len(processed_files)} map(s) generated.")
     log_info(f"Pipeline complete. Maps: {list(processed_files.keys())}", _MODULE)
-
     return processed_files
 
 
 def _apply_enabled_maps(engine_spec: dict, enabled_maps: List[str]) -> dict:
-    """Return a copy of engine_spec with enabled flags set based on enabled_maps list."""
     import copy
     spec_copy = copy.deepcopy(engine_spec)
     for map_name, cfg in spec_copy["supported_maps"].items():
@@ -218,18 +237,10 @@ def _process_and_save_maps(
     uv_region_id: str,
     project_name: str,
 ) -> Dict[str, str]:
-    """
-    Process received texture maps through Rust backend and save to temp dir.
-
-    Returns dict of map_name → file_path.
-    """
-    import tempfile
-
     output_dir = _get_temp_output_dir(context, project_name, uv_region_id)
     os.makedirs(output_dir, exist_ok=True)
 
     processed = {}
-
     for map_name, map_data in maps_response.items():
         image_b64 = map_data.get("data") or map_data.get("image_data")
         if not image_b64:
@@ -240,31 +251,27 @@ def _process_and_save_maps(
         color_space = map_cfg.get("format", "sRGB")
         file_ext = map_cfg.get("file_ext", "png")
 
-        # Try Rust processing
         final_b64 = _rust_process_map(image_b64, target_size, file_ext, color_space)
         if final_b64 is None:
-            final_b64 = image_b64  # Use raw if Rust unavailable
+            final_b64 = image_b64
 
-        # Save to temp file
         filepath = os.path.join(output_dir, f"{map_name}.{file_ext}")
         if base64_to_file(final_b64, filepath):
             processed[map_name] = filepath
-            log_debug(f"Saved map: {map_name}.{file_ext}", _MODULE)
+            log_debug(f"Saved: {map_name}.{file_ext}", _MODULE)
         else:
-            log_error(f"Failed to save map: {map_name}", _MODULE)
+            log_error(f"Failed to save: {map_name}", _MODULE)
 
     return processed
 
 
 def _rust_process_map(image_b64: str, target_size: int,
                       output_format: str, color_space: str) -> Optional[str]:
-    """Process a texture map via Rust backend. Returns processed base64 or None."""
     try:
         from .rust_bridge import get_rust_bridge
         bridge = get_rust_bridge()
         if not bridge.is_running():
             return None
-
         result = bridge.process_texture(
             image_data_b64=image_b64,
             target_size=target_size,
