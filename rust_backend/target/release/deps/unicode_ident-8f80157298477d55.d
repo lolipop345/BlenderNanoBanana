@@ -1,8 +1,0 @@
-C:\Users\memed3d\Documents\BlenderNanoBanana\rust_backend\target\release\deps\unicode_ident-8f80157298477d55.d: C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\lib.rs C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\tables.rs
-
-C:\Users\memed3d\Documents\BlenderNanoBanana\rust_backend\target\release\deps\libunicode_ident-8f80157298477d55.rlib: C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\lib.rs C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\tables.rs
-
-C:\Users\memed3d\Documents\BlenderNanoBanana\rust_backend\target\release\deps\libunicode_ident-8f80157298477d55.rmeta: C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\lib.rs C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\tables.rs
-
-C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\lib.rs:
-C:\Users\memed3d\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.24\src\tables.rs:
