@@ -1,20 +1,79 @@
 """
-BlenderNanoBanana - Prompt Engineer (Gemini 3 Flash Integration)
+BlenderNanoBanana - Prompt Engineer
 
-Calls Gemini 3 Flash with semantic context → returns JSON texture specs.
-Specs are cached to avoid redundant API calls for the same tag+engine combo.
+Calls Gemini 3 Flash with user's text prompt → returns JSON texture spec.
 """
 
 import os
-import hashlib
+import base64
 from typing import Optional, Dict, Any, List
 
-from .semantic_adapter import build_gemini_context
 from ..api.google_llm import generate_texture_spec, generate_text
-from ..utils.serialization import load_json, save_json
 from ..utils.logging import log_info, log_debug, log_error
 
 _MODULE = "PromptEngineer"
+
+_SPEC_SYSTEM_PROMPT = """\
+You are a PBR texture specialist. The user describes a surface or material.
+Return ONLY a valid JSON object — no markdown, no explanation, just JSON.
+Required fields:
+{
+  "material_type": "<primary material: leather, metal, fabric, wood, stone, skin, plastic, etc.>",
+  "detail_level": "<low|medium|high|ultra>",
+  "surface_characteristic": "<smooth|rough|glossy|matte|woven|grainy|bumpy|etc.>",
+  "color_temperature": "<warm|cool|neutral>",
+  "roughness_profile": "<smooth|slightly_rough|rough|very_rough>",
+  "imperfection_level": "<pristine|subtle|noticeable|weathered|damaged>",
+  "texture_pattern": "<none|grain|woven|scales|pores|knit|brickwork|etc.>",
+  "wear_level": "<new|slightly_worn|worn|heavily_worn|antique>",
+  "color_variation": "<uniform|subtle_variation|strong_variation|patterned>",
+  "special_properties": "<any additional relevant details, or empty string>"
+}
+"""
+
+
+def get_spec_from_prompt(
+    api_key: str,
+    user_prompt: str,
+    viewport_image_path: Optional[str] = None,
+    uv_layout_path: Optional[str] = None,
+    mesh_description: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Ask Gemini 3 Flash to generate a PBR texture spec from the user's description.
+
+    Args:
+        api_key: Google API key
+        user_prompt: User's free-text material description
+        viewport_image_path: Optional viewport screenshot for visual context
+        uv_layout_path: Optional UV layout image for structural context
+        mesh_description: Optional AI-generated mesh description
+
+    Returns:
+        JSON spec dict or None on failure.
+    """
+    images = _load_images(uv_layout_path, viewport_image_path)
+
+    user_msg = f"Material description: {user_prompt}"
+    if mesh_description:
+        user_msg += f"\nMesh analysis: {mesh_description}"
+
+    log_info(f"Generating texture spec from prompt: {user_prompt[:80]}", _MODULE)
+
+    # generate_texture_spec raises RuntimeError on API failure — let it propagate
+    spec = generate_texture_spec(
+        api_key=api_key,
+        system_prompt=_SPEC_SYSTEM_PROMPT,
+        user_prompt=user_msg,
+        images=images or None,
+    )
+
+    if spec is None:
+        raise RuntimeError("Gemini Flash returned no spec (empty response).")
+
+    spec = _validate_spec(spec, user_prompt)
+    log_info(f"Spec: {spec}", _MODULE)
+    return spec
 
 
 def get_mesh_description(
@@ -23,162 +82,76 @@ def get_mesh_description(
     uv_layout_path: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Ask Gemini 3 Flash to describe the mesh surface visible in the viewport
-    and/or UV layout. Used as additional context for texture spec generation.
-
-    Args:
-        api_key: Google API key
-        viewport_image_path: Path to 3D viewport screenshot
-        uv_layout_path: Path to exported UV layout PNG
-
-    Returns:
-        Short English description of the mesh, or None on failure.
+    Ask Gemini 3 Flash to briefly describe the mesh from viewport/UV images.
+    Used as extra context to improve texture spec accuracy.
     """
-    import base64, os
-
-    images = []
-    for path in [uv_layout_path, viewport_image_path]:
-        if path and os.path.isfile(path):
-            try:
-                with open(path, "rb") as f:
-                    data = base64.b64encode(f.read()).decode("utf-8")
-                mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
-                images.append({"mime_type": mime, "data": data})
-            except Exception:
-                pass
+    images = _load_images(uv_layout_path, viewport_image_path)
+    if not images:
+        return None
 
     system = (
-        "You are a 3D asset analyst. "
-        "Given a viewport screenshot and/or a UV layout image of a mesh, "
-        "describe in 1–3 concise sentences what kind of 3D object it is, "
-        "its apparent surface material, and any notable UV structure. "
+        "You are a 3D asset analyst. Given a viewport screenshot and/or UV layout, "
+        "describe in 1-2 sentences what kind of object it is and its surface material. "
         "Be factual and brief. No markdown."
     )
-    user = (
-        "Analyse the attached image(s) and describe this 3D mesh. "
-        "Focus on: object type, surface appearance, UV layout complexity."
-    )
+    user = "Analyse the image(s) and describe this 3D mesh object."
 
     description = generate_text(
         api_key=api_key,
         system_prompt=system,
         user_prompt=user,
-        images=images if images else None,
+        images=images,
         timeout=20.0,
     )
     if description:
-        log_info(f"Mesh description: {description[:120]}", _MODULE)
+        log_info(f"Mesh description: {description[:100]}", _MODULE)
     return description
 
 
-def get_texture_spec(
-    context,
-    api_key: str,
-    tag_id: str,
-    tag_definition: dict,
-    engine_spec: dict,
-    project_name: str,
-    viewport_image_path: Optional[str] = None,
-    reference_image_paths: Optional[List[str]] = None,
-    force_regenerate: bool = False,
-    mesh_description: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Get a texture spec JSON for a UV region.
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-    Checks spec cache first, then calls Gemini 3 Flash if needed.
-
-    Args:
-        context: Blender context
-        api_key: Google API key
-        tag_id: Semantic tag identifier
-        tag_definition: Full tag definition dict
-        engine_spec: Engine preset dict (Unity/Roblox/etc.)
-        project_name: Project name for cache organization
-        viewport_image_path: Optional viewport screenshot path
-        reference_image_paths: Optional list of reference image paths
-        force_regenerate: Skip cache and regenerate
-
-    Returns:
-        JSON spec dict, or None on failure.
-    """
-    cache_path = _get_spec_cache_path(context, project_name, tag_id, engine_spec)
-
-    # Check cache
-    if not force_regenerate and os.path.isfile(cache_path):
-        cached = load_json(cache_path)
-        if cached and "spec" in cached:
-            log_debug(f"Using cached spec for tag='{tag_id}'.", _MODULE)
-            return cached["spec"]
-
-    # Build Gemini context
-    gemini_ctx = build_gemini_context(
-        tag_id=tag_id,
-        tag_definition=tag_definition,
-        engine_spec=engine_spec,
-        viewport_image_path=viewport_image_path,
-        reference_image_paths=reference_image_paths,
-        mesh_description=mesh_description,
-    )
-
-    log_info(f"Calling Gemini 3 Flash for tag='{tag_id}', engine='{engine_spec.get('id')}'...", _MODULE)
-
-    spec = generate_texture_spec(
-        api_key=api_key,
-        system_prompt=gemini_ctx["system_prompt"],
-        user_prompt=gemini_ctx["user_prompt"],
-        images=gemini_ctx["images"],
-    )
-
-    if spec is None:
-        log_error("Gemini 3 Flash returned no spec.", _MODULE)
-        return None
-
-    # Validate required fields
-    spec = _validate_and_fill_spec(spec, tag_definition)
-
-    # Cache the result
-    save_json(cache_path, {
-        "tag_id": tag_id,
-        "engine_id": engine_spec.get("id"),
-        "spec": spec,
-    })
-
-    log_info(f"Texture spec cached: {cache_path}", _MODULE)
-    return spec
+def _load_images(
+    *paths: Optional[str],
+) -> List[Dict[str, str]]:
+    """Load image files as base64 inline_data dicts for Gemini."""
+    result = []
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode("utf-8")
+            mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+            result.append({"mime_type": mime, "data": data})
+        except Exception:
+            pass
+    return result
 
 
-def _validate_and_fill_spec(spec: dict, tag_def: dict) -> dict:
-    """
-    Ensure required fields exist. Fill missing from tag hints as fallback.
-    """
-    hints = tag_def.get("gemini_hints", {})
+def _validate_spec(spec: dict, user_prompt: str) -> dict:
+    """Ensure all required fields are present."""
+    # Infer material_type from prompt if missing
+    prompt_lower = user_prompt.lower()
+    material_hint = "generic"
+    for keyword in ["leather", "metal", "fabric", "wood", "stone", "skin",
+                    "plastic", "glass", "rubber", "cloth", "fur", "ceramic"]:
+        if keyword in prompt_lower:
+            material_hint = keyword
+            break
 
     defaults = {
-        "material_type": hints.get("material_type", "generic"),
-        "detail_level": tag_def.get("detail_level", "medium"),
+        "material_type": material_hint,
+        "detail_level": "medium",
         "surface_characteristic": "smooth",
+        "color_temperature": "neutral",
         "roughness_profile": "medium",
+        "imperfection_level": "subtle",
+        "texture_pattern": "none",
+        "wear_level": "new",
+        "color_variation": "subtle_variation",
+        "special_properties": "",
     }
-
-    for key, default_val in defaults.items():
+    for key, val in defaults.items():
         if key not in spec or not spec[key]:
-            spec[key] = default_val
-
+            spec[key] = val
     return spec
-
-
-def _get_spec_cache_path(context, project_name: str, tag_id: str, engine_spec: dict) -> str:
-    """Build a deterministic cache file path for a tag+engine combination."""
-    from .cache_manager import get_cache_base_path
-    base = get_cache_base_path(context)
-    safe_proj = _safe_name(project_name)
-    engine_id = engine_spec.get("id", "custom")
-    # Use a hash-based filename to keep it tidy
-    key = f"{tag_id}_{engine_id}"
-    fname = f"gemini_spec_{hashlib.md5(key.encode()).hexdigest()[:8]}.json"
-    return os.path.join(base, safe_proj, "gemini_specs", fname)
-
-
-def _safe_name(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)

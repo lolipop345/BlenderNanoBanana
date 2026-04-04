@@ -1,5 +1,3 @@
 .claude
-*.exe
 *.zip
-rust_backend/target
-rust_backend/Cargo.lock
+*.7z

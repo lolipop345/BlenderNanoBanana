@@ -60,8 +60,9 @@ def generate_texture_spec(
             log_info(f"Gemini spec generated: {list(spec.keys())}", _MODULE)
         return spec
     except Exception as e:
+        # Re-raise so the caller can surface a real error message to the UI
         log_error(f"Gemini API call failed: {e}", _MODULE, e)
-        return None
+        raise RuntimeError(f"Gemini Flash API error: {e}") from e
 
 
 def generate_text(

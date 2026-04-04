@@ -21,18 +21,6 @@ API_DEFAULT_TIMEOUT = 60
 API_MAX_RETRIES = 3
 API_RETRY_DELAY_SEC = 2.0       # seconds between retries
 
-# ─── Rust Backend Settings ────────────────────────────────────────────────────
-
-RUST_SERVER_PORT = 7823
-RUST_SERVER_HOST = "127.0.0.1"
-RUST_SERVER_URL = f"http://{RUST_SERVER_HOST}:{RUST_SERVER_PORT}"
-RUST_REQUEST_TIMEOUT = 30.0     # seconds for a single Rust request
-RUST_STARTUP_TIMEOUT = 10.0     # seconds to wait for Rust to start
-RUST_SHUTDOWN_TIMEOUT = 5.0
-RUST_BINARY_NAME_WIN = "blender_nanobanana_backend.exe"
-RUST_BINARY_NAME_LINUX = "blender_nanobanana_backend"
-RUST_BINARY_NAME_MAC = "blender_nanobanana_backend"
-
 # ─── Cache Settings ───────────────────────────────────────────────────────────
 
 CACHE_ENABLED = True

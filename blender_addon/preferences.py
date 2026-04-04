@@ -1,19 +1,14 @@
 """
 BlenderNanoBanana - Addon Preferences Panel
-API keys, cache settings, performance options.
+API keys, cache settings, debug options.
 """
 
 import bpy
 import os
 from bpy.types import AddonPreferences
-from bpy.props import StringProperty, IntProperty, BoolProperty, EnumProperty
+from bpy.props import StringProperty, IntProperty, BoolProperty
 
-from .config.defaults import (
-    DEFAULT_CACHE_MAX_VERSIONS,
-    DEFAULT_CACHE_AUTO_CLEANUP,
-    DEFAULT_GENERATE_REFERENCES,
-    DEFAULT_REFERENCES_COUNT,
-)
+from .config.defaults import DEFAULT_CACHE_MAX_VERSIONS, DEFAULT_CACHE_AUTO_CLEANUP
 
 
 class NanoBananaPreferences(AddonPreferences):
@@ -25,8 +20,7 @@ class NanoBananaPreferences(AddonPreferences):
         name="Google API Key",
         description=(
             "Your Google Generative AI API Key.\n"
-            "Used for both Gemini 3 Flash (JSON spec generation) "
-            "and Nano Banana (texture generation)."
+            "Used for Gemini 3 Flash (spec) and Gemini Image (texture generation)."
         ),
         subtype="PASSWORD",
         default="",
@@ -37,7 +31,7 @@ class NanoBananaPreferences(AddonPreferences):
     cache_base_path: StringProperty(
         name="Cache Directory",
         description=(
-            "Where to store generated textures and references.\n"
+            "Where to store generated textures.\n"
             "Leave empty to use the addon directory."
         ),
         subtype="DIR_PATH",
@@ -58,46 +52,6 @@ class NanoBananaPreferences(AddonPreferences):
         default=DEFAULT_CACHE_AUTO_CLEANUP,
     )
 
-    # ── Generation Settings ───────────────────────────────────────────────────
-
-    auto_generate_references: BoolProperty(
-        name="Auto-Generate References",
-        description="Automatically generate reference images before texture generation",
-        default=DEFAULT_GENERATE_REFERENCES,
-    )
-
-    references_count: IntProperty(
-        name="References to Generate",
-        description="How many reference images to generate per UV region",
-        default=DEFAULT_REFERENCES_COUNT,
-        min=1,
-        max=10,
-    )
-
-    # ── Rust Backend ──────────────────────────────────────────────────────────
-
-    def _on_rust_path_update(self, context):
-        """Stop the Rust backend when the binary path changes."""
-        try:
-            from .core.rust_bridge import get_rust_bridge
-            bridge = get_rust_bridge()
-            if bridge.is_running():
-                bridge.stop()
-                print("[NanoBanana] Rust backend stopped (binary path changed).")
-        except Exception:
-            pass
-
-    rust_binary_path: StringProperty(
-        name="Rust Backend Path",
-        description=(
-            "Path to the Rust backend binary.\n"
-            "Leave empty to use the bundled binary."
-        ),
-        subtype="FILE_PATH",
-        default="",
-        update=_on_rust_path_update,
-    )
-
     # ── Debug Settings ────────────────────────────────────────────────────────
 
     enable_debug_logging: BoolProperty(
@@ -116,28 +70,27 @@ class NanoBananaPreferences(AddonPreferences):
         dep_status = check_all()
 
         box = layout.box()
-        if dep_status["all_ok"]:
+        if dep_status.get("installing"):
             row = box.row()
-            row.label(text="Dependencies: All installed", icon="CHECKMARK")
+            row.label(text="Installing dependencies... (see System Console)", icon="TIME")
+        elif dep_status["all_ok"]:
+            box.row().label(text="Dependencies: All installed", icon="CHECKMARK")
         else:
-            box.label(text="Dependencies", icon="ERROR")
+            box.label(text="Missing dependencies:", icon="ERROR")
             for pkg in dep_status["packages"]:
-                row = box.row()
                 icon = "CHECKMARK" if pkg["installed"] else "X"
-                row.label(text=f"  {pkg['name']}", icon=icon)
+                box.row().label(text=f"  {pkg['name']}", icon=icon)
             row = box.row()
             row.scale_y = 1.4
             row.operator("nanobanana.install_dependencies",
                          text="Install Missing Dependencies", icon="IMPORT")
+            box.label(text="Auto-install runs on addon enable — check System Console",
+                      icon="INFO")
 
         # ─ API Configuration ──────────────────────────────────────────────────
         box = layout.box()
-        row = box.row()
-        row.label(text="API Configuration", icon="WORLD_DATA")
-
-        col = box.column(align=True)
-        col.prop(self, "google_api_key", icon="KEY_HLT")
-
+        box.label(text="API Configuration", icon="WORLD_DATA")
+        box.prop(self, "google_api_key", icon="KEY_HLT")
         if not self.google_api_key:
             row = box.row()
             row.alert = True
@@ -146,54 +99,18 @@ class NanoBananaPreferences(AddonPreferences):
         # ─ Cache Settings ─────────────────────────────────────────────────────
         box = layout.box()
         box.label(text="Cache Settings", icon="FILE_FOLDER")
-
         col = box.column(align=True)
         col.prop(self, "cache_base_path")
         col.prop(self, "cache_max_versions")
         col.prop(self, "cache_auto_cleanup")
 
-        # ─ Generation Settings ────────────────────────────────────────────────
+        # ─ Debug ──────────────────────────────────────────────────────────────
         box = layout.box()
-        box.label(text="Generation Settings", icon="IMAGE_DATA")
-
-        col = box.column(align=True)
-        col.prop(self, "auto_generate_references")
-        if self.auto_generate_references:
-            col.prop(self, "references_count")
-
-        # ─ Advanced ───────────────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Advanced", icon="PREFERENCES")
-
-        col = box.column(align=True)
-        col.prop(self, "rust_binary_path")
-        col.prop(self, "enable_debug_logging")
-
-        # ─ Status ─────────────────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Status", icon="INFO")
-
-        # Rust backend status
-        from .core.rust_bridge import get_rust_bridge
-        bridge = get_rust_bridge()
-        running = bridge and bridge.is_running()
-
-        row = box.row()
-        if running:
-            row.label(text="Rust Backend: Running", icon="CHECKMARK")
-        else:
-            row.label(text="Rust Backend: Not started", icon="X")
-
-        row2 = box.row(align=True)
-        row2.operator("nanobanana.start_rust_backend",
-                      text="Start Backend", icon="PLAY")
-        stop = row2.operator("nanobanana.stop_rust_backend",
-                             text="Stop Backend", icon="SNAP_FACE")
-        row2.enabled = True  # always show both buttons
+        box.label(text="Debug", icon="PREFERENCES")
+        box.prop(self, "enable_debug_logging")
 
 
 def get_preferences(context=None) -> NanoBananaPreferences:
-    """Helper to get addon preferences from any context."""
     ctx = context or bpy.context
     return ctx.preferences.addons[__package__].preferences
 

@@ -1,35 +1,59 @@
 """
 BlenderNanoBanana - Dependency Installer
 
-Installs required Python packages into Blender's bundled Python.
-Called automatically on first addon enable, or manually via the
-"Install Dependencies" button in Addon Preferences.
+Installs required Python packages into Blender's bundled Python automatically
+on first addon enable, and manually via the "Install Dependencies" button.
 
-Uses:
-  1. ensurepip  → bootstraps pip if Blender's Python doesn't have it
-  2. subprocess → calls Blender's own Python executable to pip install
+Key behaviours:
+  - Auto-install runs in a background daemon thread → Blender never freezes
+  - After install, refreshes sys.path so packages are importable immediately
+    without restarting Blender
+  - Uses sys.executable so packages always go into Blender's own Python,
+    never a system Python
 """
 
 import sys
 import subprocess
 import importlib
+import threading
 from typing import List, Tuple
 
 # ── Required packages ─────────────────────────────────────────────────────────
 #
-# Each entry: (import_name, pip_package_name, min_version_str)
-# import_name   = what you `import` in Python
-# pip_package   = what pip installs
-# min_version   = minimum acceptable version (empty = any)
+# (import_name, pip_package_name, min_version)
+# import_name  = what you `import` in Python
+# pip_package  = what pip installs
+# min_version  = minimum acceptable version ("" = any)
 
 REQUIRED_PACKAGES: List[Tuple[str, str, str]] = [
-    ("PIL",   "Pillow", "10.0.0"),
-    ("numpy", "numpy",  "1.24.0"),
+    ("PIL",    "Pillow", "9.0.0"),
+    ("numpy",  "numpy",  "1.21.0"),
+    ("requests", "requests", ""),
 ]
 
 
+# ── Status ────────────────────────────────────────────────────────────────────
+
+_install_lock   = threading.Lock()
+_install_thread: threading.Thread = None
+_install_done   = False
+_install_log: List[str] = []
+
+
+def _log(msg: str):
+    print(f"[NanoBanana::Deps] {msg}")
+    _install_log.append(msg)
+    try:
+        from .core.log_display import push
+        push(msg, "INFO")
+    except Exception:
+        pass
+
+
+# ── Package helpers ───────────────────────────────────────────────────────────
+
 def is_installed(import_name: str) -> bool:
-    """Return True if the package can be imported."""
+    """Return True if the package can be imported right now."""
     try:
         importlib.import_module(import_name)
         return True
@@ -38,12 +62,35 @@ def is_installed(import_name: str) -> bool:
 
 
 def get_missing_packages() -> List[Tuple[str, str, str]]:
-    """Return list of packages that are not yet installed."""
-    return [
-        (imp, pkg, ver)
-        for imp, pkg, ver in REQUIRED_PACKAGES
-        if not is_installed(imp)
-    ]
+    """Return entries from REQUIRED_PACKAGES that are not yet importable."""
+    return [(imp, pkg, ver) for imp, pkg, ver in REQUIRED_PACKAGES
+            if not is_installed(imp)]
+
+
+def _refresh_sys_path():
+    """
+    After a pip subprocess installs a package, Python's import machinery
+    may not know about it yet (cached directory listings).
+
+    This re-adds Blender's site-packages directories and flushes the
+    import cache so newly installed packages are findable without restart.
+    """
+    try:
+        import site
+        # Standard site-packages (Blender's Python)
+        for path in site.getsitepackages():
+            if path not in sys.path:
+                sys.path.append(path)
+        # User site-packages
+        try:
+            user_site = site.getusersitepackages()
+            if user_site and user_site not in sys.path:
+                sys.path.insert(0, user_site)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    importlib.invalidate_caches()
 
 
 def ensure_pip() -> bool:
@@ -53,132 +100,149 @@ def ensure_pip() -> bool:
         return True
     except ImportError:
         pass
-
-    print("[NanoBanana] pip not found — bootstrapping with ensurepip...")
+    _log("pip not found — bootstrapping with ensurepip...")
     try:
         import ensurepip
         ensurepip.bootstrap(upgrade=True)
-        # Reload pip
-        import importlib
         importlib.invalidate_caches()
         return True
     except Exception as e:
-        print(f"[NanoBanana] ensurepip failed: {e}")
+        _log(f"ensurepip failed: {e}")
         return False
 
 
 def install_package(pip_package: str, min_version: str = "") -> bool:
     """
-    Install a pip package into Blender's Python using subprocess.
+    Install a pip package using Blender's own Python executable (sys.executable).
+    Blocks the calling thread (not the main thread) until pip finishes.
 
-    Uses sys.executable so we always target Blender's bundled Python,
-    not any system Python that might be on PATH.
+    Returns True on success.
     """
     pkg_spec = f"{pip_package}>={min_version}" if min_version else pip_package
-
     cmd = [
-        sys.executable,       # Blender's Python
-        "-m", "pip",
-        "install",
+        sys.executable,
+        "-m", "pip", "install",
         "--upgrade",
         "--no-warn-script-location",
         pkg_spec,
     ]
-
-    print(f"[NanoBanana] Installing: {pkg_spec}")
+    _log(f"Installing {pkg_spec} ...")
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
         if result.returncode == 0:
-            print(f"[NanoBanana] ✓ Installed: {pip_package}")
+            _log(f"✓ {pip_package} installed")
+            _refresh_sys_path()
             return True
-        else:
-            print(f"[NanoBanana] ✗ Failed to install {pip_package}:")
-            print(result.stderr)
-            return False
+        _log(f"✗ {pip_package} failed:\n{result.stderr.strip()}")
+        return False
     except subprocess.TimeoutExpired:
-        print(f"[NanoBanana] ✗ Timeout installing {pip_package}")
+        _log(f"✗ {pip_package} timed out")
         return False
     except Exception as e:
-        print(f"[NanoBanana] ✗ Error installing {pip_package}: {e}")
+        _log(f"✗ {pip_package} error: {e}")
         return False
 
 
-def _vlog(msg: str, level: str = "INFO"):
-    """Push to viewport log if available."""
-    try:
-        from .core.log_display import push
-        push(msg, level)
-    except Exception:
-        pass
-
+# ── Main install routine ──────────────────────────────────────────────────────
 
 def install_all_missing() -> Tuple[List[str], List[str]]:
     """
-    Install all missing packages.
+    Install every package in REQUIRED_PACKAGES that isn't importable.
+    Meant to be called from a background thread (auto-install) or directly
+    from the manual "Install Dependencies" operator.
 
-    Returns:
-        (succeeded, failed) — lists of pip package names.
+    Returns (succeeded, failed) lists of pip package names.
     """
     missing = get_missing_packages()
     if not missing:
-        print("[NanoBanana] All dependencies already installed.")
+        _log("All dependencies already installed.")
         return [], []
 
-    print(f"[NanoBanana] Installing {len(missing)} missing package(s)...")
-    _vlog(f"Installing {len(missing)} package(s)...", "INFO")
+    _log(f"Installing {len(missing)} missing package(s): "
+         f"{[pkg for _, pkg, _ in missing]}")
 
-    # Make sure pip is available
     if not ensure_pip():
         failed = [pkg for _, pkg, _ in missing]
-        print("[NanoBanana] Cannot install — pip not available.")
+        _log("Cannot install — pip not available.")
         return [], failed
 
-    succeeded = []
-    failed = []
-
+    succeeded, failed = [], []
     for _imp, pkg, ver in missing:
-        _vlog(f"Installing {pkg}...", "INFO")
         if install_package(pkg, ver):
             succeeded.append(pkg)
-            _vlog(f"{pkg} installed", "OK")
         else:
             failed.append(pkg)
-            _vlog(f"Failed: {pkg}", "ERROR")
-
-    # Invalidate import cache so newly installed modules are found
-    importlib.invalidate_caches()
-
-    if succeeded:
-        _vlog("Done! Restart Blender.", "OK")
 
     return succeeded, failed
 
 
+# ── Background auto-install ───────────────────────────────────────────────────
+
+def auto_install_in_background():
+    """
+    Launch a daemon thread to install missing packages.
+    Returns immediately — Blender's UI is never blocked.
+
+    The thread acquires _install_lock so a second call while one is already
+    running does nothing.
+    """
+    global _install_thread, _install_done
+
+    if _install_done:
+        return   # already ran this session
+
+    if _install_thread is not None and _install_thread.is_alive():
+        return   # already running
+
+    def _worker():
+        global _install_done
+        with _install_lock:
+            try:
+                missing = get_missing_packages()
+                if missing:
+                    succeeded, failed = install_all_missing()
+                    if succeeded:
+                        _log(f"Auto-installed: {succeeded}. "
+                             "Packages are now available (no restart needed).")
+                    if failed:
+                        _log(f"Auto-install failed for: {failed}. "
+                             "Use Addon Preferences → 'Install Dependencies'.")
+                else:
+                    _log("All dependencies present.")
+            except Exception as e:
+                _log(f"Auto-install error: {e}")
+            finally:
+                _install_done = True
+
+    _install_thread = threading.Thread(target=_worker, name="NB-DepInstall", daemon=True)
+    _install_thread.start()
+
+
+# ── Status check (for preferences UI) ────────────────────────────────────────
+
 def check_all() -> dict:
     """
-    Check status of all required packages.
+    Return status of all required packages.
 
-    Returns:
+    Result:
         {
             "all_ok": bool,
-            "packages": [
-                {"name": str, "import": str, "installed": bool},
-                ...
-            ]
+            "installing": bool,   # True if background thread is still running
+            "packages": [{"name": str, "import": str, "installed": bool}, ...]
         }
     """
-    packages = []
-    for imp, pkg, ver in REQUIRED_PACKAGES:
-        packages.append({
-            "name": pkg,
-            "import": imp,
-            "installed": is_installed(imp),
-        })
-
-    all_ok = all(p["installed"] for p in packages)
-    return {"all_ok": all_ok, "packages": packages}
+    installing = (_install_thread is not None and _install_thread.is_alive())
+    packages = [
+        {"name": pkg, "import": imp, "installed": is_installed(imp)}
+        for imp, pkg, _ in REQUIRED_PACKAGES
+    ]
+    return {
+        "all_ok": all(p["installed"] for p in packages),
+        "installing": installing,
+        "packages": packages,
+    }

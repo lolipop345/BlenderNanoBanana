@@ -1,8 +1,9 @@
 """
 BlenderNanoBanana - Dependency Install Operator
 
-Installs missing Python packages into Blender's bundled Python.
-Shows progress in the console. Reports success/failure in the UI.
+Manual "Install Dependencies" button for Addon Preferences.
+Auto-install runs automatically in the background on addon enable —
+this button is a fallback if auto-install fails (e.g. no internet on first use).
 """
 
 import bpy
@@ -10,35 +11,40 @@ from bpy.types import Operator
 
 
 class NANOBANANA_OT_install_dependencies(Operator):
-    """Install missing Python dependencies into Blender's Python"""
+    """Install missing Python dependencies into Blender's Python (runs in background)"""
     bl_idname = "nanobanana.install_dependencies"
     bl_label = "Install Dependencies"
     bl_options = {"REGISTER", "INTERNAL"}
 
     def execute(self, context):
-        from ..install_dependencies import install_all_missing, check_all
+        from ..install_dependencies import check_all, auto_install_in_background
 
-        self.report({"INFO"}, "Installing dependencies... (check System Console for progress)")
+        status = check_all()
 
-        succeeded, failed = install_all_missing()
+        if status["installing"]:
+            self.report({"INFO"}, "Installation already running — check System Console for progress.")
+            return {"FINISHED"}
 
-        if failed:
-            self.report(
-                {"ERROR"},
-                f"Failed to install: {', '.join(failed)}. "
-                "Open the System Console (Window → Toggle System Console) for details."
-            )
-            return {"CANCELLED"}
+        if status["all_ok"]:
+            self.report({"INFO"}, "All dependencies are already installed.")
+            return {"FINISHED"}
 
-        if succeeded:
-            self.report(
-                {"INFO"},
-                f"Successfully installed: {', '.join(succeeded)}. "
-                "Restart Blender to complete setup."
-            )
-        else:
-            self.report({"INFO"}, "All dependencies were already installed.")
+        # Reset _install_done so the background worker runs again
+        import blender_addon.install_dependencies as _dep  # noqa
+        try:
+            from .. import install_dependencies as _dep
+            _dep._install_done = False
+        except Exception:
+            pass
 
+        auto_install_in_background()
+
+        missing_names = [p["name"] for p in status["packages"] if not p["installed"]]
+        self.report(
+            {"INFO"},
+            f"Installing {missing_names} in background — check System Console for progress. "
+            "Packages will be available immediately after install (no restart needed)."
+        )
         return {"FINISHED"}
 
     def invoke(self, context, event):

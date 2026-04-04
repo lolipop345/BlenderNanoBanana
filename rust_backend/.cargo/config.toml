@@ -1,4 +1,0 @@
-# Use rust-lld for the GNU Windows target — avoids requiring dlltool.exe from MinGW
-[target.x86_64-pc-windows-gnu]
-linker = "rust-lld"
-ar = "llvm-ar"

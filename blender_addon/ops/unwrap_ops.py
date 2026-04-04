@@ -179,9 +179,106 @@ class NANOBANANA_OT_select_uv_island(Operator):
                 area.tag_redraw()
 
         # Set as active region
-        context.scene.nano_banana.active_uv_region_id = self.island_id
+        props = context.scene.nano_banana
+        props.active_uv_region_id = self.island_id
+
+        # Auto-load existing tag into input field
+        import json
+        try:
+            tags = json.loads(props.island_tags_json or "{}")
+        except Exception:
+            tags = {}
+        props.island_tag_input = tags.get(self.island_id, "")
 
         self.report({"INFO"}, f"Selected island: {self.island_id} ({len(face_indices)} faces)")
+        return {"FINISHED"}
+
+
+class NANOBANANA_OT_set_island_tag(Operator):
+    """Save the typed material tag to the selected UV island"""
+    bl_idname = "nanobanana.set_island_tag"
+    bl_label = "Set Island Tag"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.nano_banana
+        island_id = props.active_uv_region_id
+        tag_text  = props.island_tag_input.strip()
+
+        if not island_id:
+            self.report({"WARNING"}, "No island selected.")
+            return {"CANCELLED"}
+
+        import json
+        try:
+            tags = json.loads(props.island_tags_json or "{}")
+        except Exception:
+            tags = {}
+
+        if tag_text:
+            tags[island_id] = tag_text
+        else:
+            tags.pop(island_id, None)
+
+        props.island_tags_json = json.dumps(tags)
+        action = f"set to '{tag_text}'" if tag_text else "cleared"
+        self.report({"INFO"}, f"{island_id} tag {action}.")
+        return {"FINISHED"}
+
+
+class NANOBANANA_OT_clear_island_tag(Operator):
+    """Remove the material tag from the selected UV island"""
+    bl_idname = "nanobanana.clear_island_tag"
+    bl_label = "Clear Tag"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.nano_banana
+        island_id = props.active_uv_region_id
+        if not island_id:
+            self.report({"WARNING"}, "No island selected.")
+            return {"CANCELLED"}
+
+        import json
+        try:
+            tags = json.loads(props.island_tags_json or "{}")
+        except Exception:
+            tags = {}
+
+        if island_id in tags:
+            del tags[island_id]
+            props.island_tags_json = json.dumps(tags)
+            props.island_tag_input = ""
+            self.report({"INFO"}, f"Tag cleared for {island_id}.")
+        return {"FINISHED"}
+
+
+class NANOBANANA_OT_quick_island_tag(Operator):
+    """Instantly assign a preset material tag to the selected island"""
+    bl_idname = "nanobanana.quick_island_tag"
+    bl_label = "Quick Tag"
+    bl_options = {"REGISTER", "UNDO"}
+
+    tag: StringProperty(name="Tag", default="")
+
+    def execute(self, context):
+        props = context.scene.nano_banana
+        island_id = props.active_uv_region_id
+        if not island_id:
+            self.report({"WARNING"}, "No island selected.")
+            return {"CANCELLED"}
+        if not self.tag:
+            return {"CANCELLED"}
+
+        import json
+        try:
+            tags = json.loads(props.island_tags_json or "{}")
+        except Exception:
+            tags = {}
+        tags[island_id] = self.tag
+        props.island_tags_json = json.dumps(tags)
+        props.island_tag_input = self.tag
+        self.report({"INFO"}, f"{island_id} → {self.tag}")
         return {"FINISHED"}
 
 
@@ -216,6 +313,9 @@ CLASSES = [
     NANOBANANA_OT_pack_islands,
     NANOBANANA_OT_analyze_uv_islands,
     NANOBANANA_OT_select_uv_island,
+    NANOBANANA_OT_set_island_tag,
+    NANOBANANA_OT_clear_island_tag,
+    NANOBANANA_OT_quick_island_tag,
     NANOBANANA_OT_island_page,
 ]
 

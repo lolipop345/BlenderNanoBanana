@@ -1,9 +1,8 @@
 """
 BlenderNanoBanana - Blender Addon Entry Point
 
-UV mapping and PBR texture generation using Google's Nano Banana vision model.
-Gemini 3 Flash generates structured JSON specs → Nano Banana generates textures.
-Rust backend handles performance-critical operations (10x speedup).
+UV mapping and PBR texture generation using Google's Gemini models.
+Gemini 3 Flash generates structured JSON specs → Gemini Image API generates textures.
 """
 
 bl_info = {
@@ -34,24 +33,13 @@ from bpy.props import (
 
 def _auto_install_dependencies():
     """
-    Silently install missing packages on first addon enable.
-    Does NOT block Blender startup — runs in background and reports to console.
-    Missing packages won't crash the addon; features gracefully degrade.
+    Kick off a background daemon thread to install any missing packages.
+    Returns immediately — Blender's UI is never blocked.
+    Progress is printed to the System Console.
     """
     try:
-        from .install_dependencies import get_missing_packages, install_all_missing
-        missing = get_missing_packages()
-        if missing:
-            pkg_names = [pkg for _, pkg, _ in missing]
-            print(f"[NanoBanana] Auto-installing missing packages: {pkg_names}")
-            succeeded, failed = install_all_missing()
-            if succeeded:
-                print(f"[NanoBanana] Auto-installed: {succeeded}")
-            if failed:
-                print(
-                    f"[NanoBanana] Could not auto-install: {failed}. "
-                    "Use Addon Preferences → 'Install Dependencies' button."
-                )
+        from .install_dependencies import auto_install_in_background
+        auto_install_in_background()
     except Exception as e:
         print(f"[NanoBanana] Dependency check error: {e}")
 
@@ -61,101 +49,48 @@ def _auto_install_dependencies():
 def _register_modules():
     """Import and register all addon modules in dependency order."""
     from . import preferences
-    from .ops import install_ops
-    from .core import log_display
-    from .ops import (
-        model_ops,
-        unwrap_ops,
-        semantic_ops,
-        reference_ops,
-        texture_ops,
-        cache_ops,
-        seam_tag_ops,
-    )
-    from .ui import (
-        main_panel,
-        model_panel,
-        uv_panel,
-        semantic_panel,
-        texture_panel,
-        cache_panel,
-        viewport_overlay,
-        image_editor_panel,
-    )
+    from .ops import install_ops, model_ops, unwrap_ops, texture_ops, cache_ops, seam_tag_ops
+    from .ui import uv_panel, texture_panel, image_editor_panel, viewport_overlay
     from .core import uv_seam_overlay
     from .utils import preview_manager
 
-    modules = [
+    return [
         preferences,
         install_ops,
-        log_display,
         model_ops,
         unwrap_ops,
-        semantic_ops,
-        reference_ops,
         texture_ops,
         cache_ops,
         seam_tag_ops,
-        main_panel,
-        model_panel,
         uv_panel,
-        semantic_panel,
         texture_panel,
-        cache_panel,
-        viewport_overlay,
         image_editor_panel,
+        viewport_overlay,
         uv_seam_overlay,
         preview_manager,
     ]
-    return modules
 
 
 def _unregister_modules():
     """Import modules for unregistration (reverse order)."""
     from . import preferences
-    from .ops import install_ops
-    from .core import log_display
-    from .ops import (
-        model_ops,
-        unwrap_ops,
-        semantic_ops,
-        reference_ops,
-        texture_ops,
-        cache_ops,
-        seam_tag_ops,
-    )
-    from .ui import (
-        main_panel,
-        model_panel,
-        uv_panel,
-        semantic_panel,
-        texture_panel,
-        cache_panel,
-        viewport_overlay,
-        image_editor_panel,
-    )
+    from .ops import install_ops, model_ops, unwrap_ops, texture_ops, cache_ops, seam_tag_ops
+    from .ui import uv_panel, texture_panel, image_editor_panel, viewport_overlay
     from .core import uv_seam_overlay
     from .utils import preview_manager
 
     return [
         preview_manager,
         uv_seam_overlay,
-        image_editor_panel,
         viewport_overlay,
-        cache_panel,
+        image_editor_panel,
         texture_panel,
-        semantic_panel,
         uv_panel,
-        model_panel,
-        main_panel,
         seam_tag_ops,
         cache_ops,
         texture_ops,
-        reference_ops,
-        semantic_ops,
         unwrap_ops,
         model_ops,
-        log_display,
         install_ops,
         preferences,
     ]
@@ -166,14 +101,20 @@ def _unregister_modules():
 class NanoBananaSceneProps(bpy.types.PropertyGroup):
     """Per-scene properties stored on bpy.context.scene."""
 
-    # Active UV island / region
+    # ── Generation ────────────────────────────────────────────────────────────
+    generation_prompt: StringProperty(
+        name="Texture Description",
+        description="Describe the material/texture you want to generate",
+        default="",
+    )
+
+    # UV seam tagging (still used in UV editor)
     active_uv_region_id: StringProperty(
         name="Active UV Region",
         description="ID of the currently selected UV island region",
         default="",
     )
 
-    # Semantic tag applied to active region
     active_semantic_tag: EnumProperty(
         name="Semantic Tag",
         description="Material type tag for the selected UV region",
@@ -246,6 +187,20 @@ class NanoBananaSceneProps(bpy.types.PropertyGroup):
         default="{}",
     )
 
+    # Island-level material tags — JSON: {"uv_001": "Skin", "uv_002": "Metal Armor", ...}
+    island_tags_json: StringProperty(
+        name="Island Tags",
+        description="Per-island material label (JSON) — persists across prompt changes",
+        default="{}",
+    )
+
+    # Text field for typing an island tag in the UV panel
+    island_tag_input: StringProperty(
+        name="Material Tag",
+        description="Material label for the selected UV island (e.g. Skin, Metal Armor, Cloth)",
+        default="",
+    )
+
     # Last generated maps — JSON: {"albedo": "/path/...", "normal": "/path/..."}
     last_generated_maps_json: StringProperty(
         name="Last Generated Maps",
@@ -313,9 +268,6 @@ def register():
         import traceback
         traceback.print_exc()
 
-    # Auto-start Rust backend
-    _start_rust_backend()
-
     # Reset all session-only state that shouldn't persist across addon reloads
     try:
         import bpy as _bpy
@@ -323,9 +275,9 @@ def register():
             props = getattr(scene, "nano_banana", None)
             if props is not None:
                 props.last_generated_maps_json = "{}"
-                props.is_generating = False
+                props.is_generating       = False
                 props.generation_progress = 0.0
-                props.generation_status = "Ready"
+                props.generation_status   = "Ready"
     except Exception:
         pass
 
@@ -334,9 +286,6 @@ def register():
 
 def unregister():
     global _registered_modules
-
-    # Stop Rust backend
-    _stop_rust_backend()
 
     # Unregister modules in reverse
     try:
@@ -357,28 +306,3 @@ def unregister():
     print("[NanoBanana] Addon unregistered.")
 
 
-def _start_rust_backend():
-    """Attempt to start the Rust backend subprocess on addon load."""
-    try:
-        from .core.rust_bridge import get_rust_bridge
-        bridge = get_rust_bridge()
-        if bridge and not bridge.is_running():
-            success = bridge.start()
-            if success:
-                print("[NanoBanana] Rust backend started.")
-            else:
-                print("[NanoBanana] Rust backend failed to start (will retry on use).")
-    except Exception as e:
-        print(f"[NanoBanana] Could not start Rust backend: {e}")
-
-
-def _stop_rust_backend():
-    """Stop the Rust backend subprocess on addon unload."""
-    try:
-        from .core.rust_bridge import get_rust_bridge
-        bridge = get_rust_bridge()
-        if bridge and bridge.is_running():
-            bridge.stop()
-            print("[NanoBanana] Rust backend stopped.")
-    except Exception as e:
-        print(f"[NanoBanana] Could not stop Rust backend: {e}")

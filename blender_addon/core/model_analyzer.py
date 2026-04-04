@@ -1,8 +1,5 @@
 """
-BlenderNanoBanana - 3D Model Analyzer
-
-Python wrapper that calls Rust backend for fast mesh analysis.
-Falls back to pure Python if Rust is unavailable.
+BlenderNanoBanana - 3D Model Analyzer (pure Python)
 """
 
 from typing import Optional, Dict, Any
@@ -11,15 +8,12 @@ from ..utils.mesh_utils import get_active_mesh_data
 from ..utils.geometry import mesh_bounding_box, check_symmetry_x
 from ..utils.logging import log_info, log_debug, log_error
 
-
 _MODULE = "ModelAnalyzer"
 
 
 def analyze_active_mesh(context) -> Optional[Dict[str, Any]]:
     """
     Analyze the active mesh object.
-
-    Calls Rust for fast analysis; falls back to Python.
 
     Returns:
         {
@@ -43,29 +37,10 @@ def analyze_active_mesh(context) -> Optional[Dict[str, Any]]:
     log_debug(f"Analyzing mesh '{mesh_data['object_name']}' "
               f"({mesh_data['vertex_count']} verts, {mesh_data['face_count']} faces)", _MODULE)
 
-    # Try Rust backend first
-    try:
-        from .rust_bridge import get_rust_bridge
-        bridge = get_rust_bridge()
-        if bridge.is_running():
-            result = bridge.analyze_mesh(
-                vertices=mesh_data["vertices"],
-                faces=mesh_data["faces"],
-                normals=mesh_data["normals"],
-            )
-            result["object_name"] = mesh_data["object_name"]
-            result["seam_count"] = len(mesh_data["seams"])
-            log_debug("Rust analysis complete.", _MODULE)
-            return result
-    except Exception as e:
-        log_error(f"Rust analysis failed, falling back to Python: {e}", _MODULE, e)
-
-    # Python fallback
     return _python_analyze(mesh_data)
 
 
 def _python_analyze(mesh_data: dict) -> dict:
-    """Pure Python mesh analysis fallback."""
     vertices = mesh_data["vertices"]
     faces = mesh_data["faces"]
     seams = mesh_data["seams"]
@@ -73,10 +48,8 @@ def _python_analyze(mesh_data: dict) -> dict:
     bounds = mesh_bounding_box(vertices)
     has_sym = check_symmetry_x(vertices)
 
-    # Estimate UV island count from seams (rough: seams divide topology)
     uv_islands_est = max(1, len(seams) // 4 + 1)
 
-    # Simple manifold check: every edge should have exactly 2 adjacent faces
     edge_face_count: Dict[tuple, int] = {}
     for face in faces:
         n = len(face)

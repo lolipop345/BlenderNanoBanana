@@ -196,6 +196,10 @@ class NANOBANANA_PT_ie_generate(Panel):
             except Exception:
                 pct = int(props.generation_progress * 100)
                 layout.label(text=f"{pct}%  {props.generation_status}")
+            cancel_row = layout.row()
+            cancel_row.alert = True
+            cancel_row.operator("nanobanana.cancel_generation",
+                                text="Cancel", icon="X")
 
         # ── Apply cached ──────────────────────────────────────────────────────
         layout.separator()
