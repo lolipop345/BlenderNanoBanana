@@ -28,7 +28,7 @@ from typing import List, Tuple
 REQUIRED_PACKAGES: List[Tuple[str, str, str]] = [
     ("PIL",    "Pillow", "9.0.0"),
     ("numpy",  "numpy",  "1.21.0"),
-    ("requests", "requests", ""),
+    ("google.genai", "google-genai", ""),
 ]
 
 

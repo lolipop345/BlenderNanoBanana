@@ -1,0 +1,4 @@
+SUCCESS_INIT
+Blender 4.5.4 LTS (hash b3efe983cc58 built 2025-10-28 01:31:05)
+
+Blender quit

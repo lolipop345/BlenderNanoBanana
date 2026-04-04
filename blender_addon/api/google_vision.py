@@ -2,66 +2,25 @@
 BlenderNanoBanana - Gemini Image API Integration
 
 Generates PBR texture maps using the Gemini 3.1 Flash Image model
-(gemini-3.1-flash-image-preview) via the standard generateContent endpoint.
+(gemini-3.1-flash-image-preview) via the google-genai SDK.
 
-Pipeline context:
-  The caller (texture_generator.py) first combines everything —
-  user prompt + island tags + UV island positions — into one enriched text,
-  then converts it to a JSON material spec via Gemini Flash, then passes
-  that spec here. Each map gets a tailored natural-language prompt built
-  from the spec fields.
-
-Each texture map is generated with a separate API call — the Gemini image API
-produces one image per call.
-
-Endpoint:
-  POST https://generativelanguage.googleapis.com/v1beta/models/
-       gemini-3.1-flash-image-preview:generateContent
-
-Request:
-  {
-    "contents": [
-      {
-        "role": "user",
-        "parts": [
-          {"text": "<prompt>"},
-          {"inline_data": {"mime_type": "image/png", "data": "<base64>"}},  # optional refs
-          ...
-        ]
-      }
-    ],
-    "generationConfig": {
-      "responseModalities": ["IMAGE"],
-      "imageConfig": {"aspectRatio": "1:1", "imageSize": "2K"}
-    }
-  }
-
-Response:
-  {
-    "candidates": [{
-      "content": {
-        "parts": [
-          {"inline_data": {"mime_type": "image/png", "data": "<base64>"}}
-        ]
-      }
-    }]
-  }
+UV layout image is sent as compressed context so Gemini adapts
+the texture to the mesh UV structure.
 """
 
 from typing import Optional, Dict, Any, List
+import base64
+import time
+import io
 
-from .api_client import APIClient
 from ..config.constants import (
     GEMINI_IMAGE_MODEL_ID,
-    GEMINI_API_BASE_URL,
     GEMINI_IMAGE_TIMEOUT,
     GEMINI_IMAGE_RETRY_COUNT,
 )
 from ..utils.logging import log_info, log_debug, log_error
 
 _MODULE = "GeminiImageAPI"
-
-_ENDPOINT = f"/v1beta/models/{GEMINI_IMAGE_MODEL_ID}:generateContent"
 
 # Per-map prompt descriptions
 _MAP_PROMPTS = {
@@ -76,6 +35,65 @@ _MAP_PROMPTS = {
 }
 
 
+def _compress_b64(b64_str: str, max_size: int = 512) -> str:
+    """
+    Decode a base64 image, resize to max_size on the longest axis,
+    and re-encode as JPEG (much smaller than PNG) for upload.
+    Falls back to original data on any error.
+    """
+    try:
+        from PIL import Image
+        data = base64.b64decode(b64_str)
+        img = Image.open(io.BytesIO(data))
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        log_debug(f"Image compression failed (using original): {e}", _MODULE)
+        return b64_str
+
+
+def _make_client(api_key: str, timeout_sec: int):
+    """
+    Create a genai.Client and apply three patches to prevent WriteTimeout:
+
+    1. patch _httpx_client._timeout     → unlimited write/read/pool, 60s connect
+    2. patch _async_httpx_client._timeout → same
+    3. patch _http_options.timeout = None → SDK passes timeout=None to httpx.send(),
+       which then falls back to _timeout (our unlimited value) instead of
+       passing timeout=120 which would override our patch.
+
+    Confirmed working in Blender 4.5 LTS + google-genai 1.70.0 + httpx 0.28.1.
+    """
+    from google import genai
+    import httpx
+
+    # connect=60s, write/read/pool = unlimited (None)
+    hx_no_timeout = httpx.Timeout(timeout=None, connect=60.0)
+
+    client = genai.Client(api_key=api_key, http_options={"timeout": timeout_sec})
+
+    # Patch 1 & 2: httpx client _timeout attributes
+    try:
+        client._api_client._httpx_client._timeout = hx_no_timeout
+    except Exception as e:
+        log_debug(f"Could not patch sync httpx _timeout: {e}", _MODULE)
+
+    try:
+        client._api_client._async_httpx_client._timeout = hx_no_timeout
+    except Exception as e:
+        log_debug(f"Could not patch async httpx _timeout: {e}", _MODULE)
+
+    # Patch 3: _http_options.timeout → None so SDK doesn't override _timeout per-request
+    try:
+        client._api_client._http_options.timeout = None
+    except Exception as e:
+        log_debug(f"Could not patch _http_options.timeout: {e}", _MODULE)
+
+    return client
+
+
 def generate_textures(
     api_key: str,
     json_spec: Dict[str, Any],
@@ -88,25 +106,57 @@ def generate_textures(
     """
     Generate PBR texture maps via Gemini Image API.
 
-    One API call per map. The json_spec (produced from the fully-combined prompt)
-    drives per-map natural-language prompts.
-
-    Args:
-        api_key: Google API key
-        json_spec: Material spec dict from Gemini Flash (already derived from
-                   combined prompt = user text + island tags + UV positions)
-        maps_to_generate: List of map names e.g. ["albedo", "normal"]
-        engine_specs: Per-map config {"albedo": {"size": 2048, "format": "sRGB"}, ...}
-        visual_context_b64: Optional list of base64 images (UV layout first, then viewport)
-        progress_cb: Optional callable(frac: float, msg: str)
-        cancel_flag: Optional threading.Event — set to stop generation
+    Sends the UV layout (and optionally viewport) image as compressed context
+    so Gemini understands the mesh shape and UV structure. Each map gets a
+    UV-aware prompt that instructs Gemini to cover the full UV 0-1 space.
 
     Returns:
         {"maps": {"albedo": {"data": b64, "mime_type": "image/png"}, ...}} or None.
     """
-    client = APIClient(api_key=api_key, base_url=GEMINI_API_BASE_URL)
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("google-genai is not installed yet. Please wait for dependencies to install.")
+
+    client = _make_client(api_key, GEMINI_IMAGE_TIMEOUT)
+
     results: Dict[str, Dict[str, str]] = {}
     total = len(maps_to_generate)
+
+    # Compress and prepare context images (UV layout first, then viewport)
+    # Timeout is now properly unlimited so we can safely upload these.
+    context_parts = []
+    if visual_context_b64:
+        for img_b64 in visual_context_b64[:2]:   # max 2 images
+            if not img_b64:
+                continue
+            try:
+                compressed = _compress_b64(img_b64, max_size=512)
+                context_parts.append(
+                    types.Part.from_bytes(
+                        data=base64.b64decode(compressed),
+                        mime_type="image/jpeg"
+                    )
+                )
+                log_debug("Context image compressed and added.", _MODULE)
+            except Exception as e:
+                log_debug(f"Could not compress context image: {e}", _MODULE)
+
+    # UV-aware prompt suffix — adapts the texture to the UV layout shown
+    if context_parts:
+        uv_suffix = (
+            " The reference image shows the UV layout of the 3D mesh. "
+            "Generate a texture that fills the full UV 0-1 space and adapts "
+            "to the UV island arrangement. The texture should be consistent "
+            "across the entire UV space, not tiled. "
+            "1:1 square aspect ratio. No text, no watermarks."
+        )
+    else:
+        uv_suffix = (
+            " Seamless, tileable. "
+            "1:1 square aspect ratio. No text, no watermarks."
+        )
 
     for idx, map_name in enumerate(maps_to_generate):
         if cancel_flag is not None and cancel_flag.is_set():
@@ -117,19 +167,27 @@ def generate_textures(
             progress_cb(idx / total, f"Generating {map_name}...")
 
         map_cfg = engine_specs.get(map_name, {})
-        prompt  = _build_map_prompt(map_name, json_spec, map_cfg)
-        payload = _build_image_payload(prompt, visual_context_b64)
+        prompt  = _build_map_prompt(map_name, json_spec, map_cfg) + uv_suffix
 
-        log_info(f"Generating {map_name} ({idx+1}/{total})...", _MODULE)
+        # UV layout image goes FIRST, then the text prompt
+        request_parts = context_parts + [prompt]
+
+        config = types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(
+                aspect_ratio="1:1"
+            )
+        )
+
+        log_info(f"Generating {map_name} ({idx+1}/{total}) "
+                 f"({'with UV context' if context_parts else 'text-only'})...", _MODULE)
 
         try:
-            image_b64, mime_type = _call_image_api(client, payload, map_name)
-        except RuntimeError as e:
-            # Re-raise with map context so the UI message is informative
-            raise RuntimeError(str(e)) from e
-
-        results[map_name] = {"data": image_b64, "mime_type": mime_type}
-        log_info(f"Done: {map_name}", _MODULE)
+            image_b64, mime_type = _call_image_api_with_retry(client, request_parts, config, map_name)
+            results[map_name] = {"data": image_b64, "mime_type": mime_type}
+            log_info(f"Done: {map_name}", _MODULE)
+        except Exception as e:
+            raise RuntimeError(f"Gemini Image API failed for '{map_name}': {e}") from e
 
     return {"maps": results} if results else None
 
@@ -141,21 +199,19 @@ def generate_reference_image(
 ) -> Optional[str]:
     """
     Generate a single reference image for a UV region.
-
-    Args:
-        api_key: Google API key
-        tag_definition: Semantic tag definition dict
-        viewport_b64: Optional base64-encoded viewport screenshot
-
-    Returns:
-        Base64-encoded PNG image string, or None on failure.
     """
-    client = APIClient(api_key=api_key, base_url=GEMINI_API_BASE_URL)
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("google-genai is not installed yet. Please wait for dependencies to install.")
 
-    tag_name = tag_definition.get("name", "material")
+    client = _make_client(api_key, GEMINI_IMAGE_TIMEOUT)
+
+    tag_name    = tag_definition.get("name", "material")
     description = tag_definition.get("description", "")
-    realism = tag_definition.get("realism", "realistic")
-    detail = tag_definition.get("detail_level", "medium")
+    realism     = tag_definition.get("realism", "realistic")
+    detail      = tag_definition.get("detail_level", "medium")
 
     prompt = (
         f"Generate a {realism} reference image for a '{tag_name}' material texture. "
@@ -163,45 +219,55 @@ def generate_reference_image(
         f"Detail level: {detail}. "
         "The image should show the material's surface texture clearly, "
         "suitable for use as a PBR texture reference. "
-        "Square composition, close-up surface view."
+        "Square composition, close-up surface view. No text, no watermarks."
     )
 
-    context_images = [viewport_b64] if viewport_b64 else None
-    payload = _build_image_payload(prompt, context_images)
+    request_parts = [prompt]
+    if viewport_b64:
+        try:
+            compressed = _compress_b64(viewport_b64, max_size=512)
+            request_parts = [
+                types.Part.from_bytes(data=base64.b64decode(compressed), mime_type="image/jpeg"),
+                prompt,
+            ]
+        except Exception as e:
+            log_debug(f"Could not compress viewport for reference: {e}", _MODULE)
+
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        image_config=types.ImageConfig(aspect_ratio="1:1")
+    )
 
     log_debug(f"Generating reference image for tag '{tag_name}'...", _MODULE)
 
-    image_b64, _ = _call_image_api(client, payload, "reference")
-    if image_b64:
+    try:
+        image_b64, _ = _call_image_api_with_retry(client, request_parts, config, "reference")
         log_info(f"Reference image generated for '{tag_name}'.", _MODULE)
-    return image_b64
+        return image_b64
+    except Exception as e:
+        log_error(f"Failed to generate reference image: {e}", _MODULE, e)
+        return None
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _build_map_prompt(map_name: str, spec: Dict[str, Any], map_cfg: Dict[str, Any]) -> str:
-    """
-    Build the per-map image prompt from the JSON spec.
-
-    The spec was generated by Gemini Flash from the fully-combined prompt
-    (user text + island tags + UV island positions), so all that context
-    is already baked into spec's fields.
-    """
-    map_desc      = _MAP_PROMPTS.get(map_name, f"{map_name} texture map")
-    material      = spec.get("material_type", "generic material")
-    detail        = spec.get("detail_level", "medium")
-    surface       = spec.get("surface_characteristic", "")
-    roughness     = spec.get("roughness_profile", "")
-    imperfection  = spec.get("imperfection_level", "subtle")
-    pattern       = spec.get("texture_pattern", "")
-    wear          = spec.get("wear_level", "new")
-    color_temp    = spec.get("color_temperature", "neutral")
-    color_var     = spec.get("color_variation", "subtle_variation")
-    special       = spec.get("special_properties", "")
-    engine_format = map_cfg.get("format", "")
+    """Build the per-map image prompt from the JSON spec."""
+    map_desc     = _MAP_PROMPTS.get(map_name, f"{map_name} texture map")
+    material     = spec.get("material_type", "generic material")
+    detail       = spec.get("detail_level", "medium")
+    surface      = spec.get("surface_characteristic", "")
+    roughness    = spec.get("roughness_profile", "")
+    imperfection = spec.get("imperfection_level", "subtle")
+    pattern      = spec.get("texture_pattern", "")
+    wear         = spec.get("wear_level", "new")
+    color_temp   = spec.get("color_temperature", "neutral")
+    color_var    = spec.get("color_variation", "subtle_variation")
+    special      = spec.get("special_properties", "")
+    fmt          = map_cfg.get("format", "")
 
     parts = [
-        f"Generate a seamless, tileable {map_desc}.",
+        f"Generate a high-quality {map_desc}.",
         f"Material type: {material}.",
         f"Detail level: {detail}.",
     ]
@@ -219,129 +285,83 @@ def _build_map_prompt(map_name: str, spec: Dict[str, Any], map_cfg: Dict[str, An
         parts.append(f"Color temperature: {color_temp}. Color variation: {color_var}.")
     if special:
         parts.append(f"Special properties: {special}.")
-    if engine_format:
-        parts.append(f"Color space: {engine_format}.")
-    parts.append(
-        "Square 1:1 aspect ratio. High quality, professional PBR game asset."
-        " No text, no watermarks, no UI elements."
-    )
+    if fmt:
+        parts.append(f"Color space: {fmt}.")
 
     return " ".join(parts)
 
 
-def _build_image_payload(
-    prompt: str,
-    context_images_b64: Optional[List[str]],
-) -> dict:
-    """Build the Gemini generateContent payload for image generation."""
-    parts = [{"text": prompt}]
-
-    # Attach reference/viewport images as inline_data (API max 14 images)
-    if context_images_b64:
-        for img_b64 in context_images_b64[:14]:
-            if img_b64:
-                parts.append({
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": img_b64,
-                    }
-                })
-
-    return {
-        "contents": [
-            {
-                "role": "user",
-                "parts": parts,
-            }
-        ],
-        "generationConfig": {
-            "responseModalities": ["IMAGE"],
-            "imageConfig": {
-                "aspectRatio": "1:1",
-            },
-        },
-    }
-
-
-def _call_image_api(
-    client: APIClient,
-    payload: dict,
+def _call_image_api_with_retry(
+    client: Any,
+    parts: list,
+    config: Any,
     map_name: str,
 ) -> tuple:
     """
-    POST to the Gemini image endpoint and extract the image from the response.
-
-    Returns:
-        (base64_str, mime_type) or (None, None) on failure.
+    Call Gemini Image API with retries. Returns (base64_str, mime_type).
+    Raises RuntimeError if all attempts fail.
     """
-    last_error = None
-    for attempt in range(1, GEMINI_IMAGE_RETRY_COUNT + 1):
+    last_error = "Unknown error"
+    max_attempts = GEMINI_IMAGE_RETRY_COUNT + 1
+
+    for attempt in range(1, max_attempts + 1):
         try:
-            response = client.post_json(_ENDPOINT, payload, timeout=GEMINI_IMAGE_TIMEOUT)
-            b64, mime = _parse_image_response(response)
-            if b64:
-                return b64, mime
-            # No image in response — log details and store reason
-            reason = _log_response_debug(response, map_name, attempt)
-            last_error = reason
+            response = client.models.generate_content(
+                model=GEMINI_IMAGE_MODEL_ID,
+                contents=parts,
+                config=config,
+            )
+
+            if not response.candidates:
+                last_error = "API returned no candidates."
+                log_error(f"No candidates for '{map_name}' (attempt {attempt})", _MODULE)
+                continue
+
+            for part in response.candidates[0].content.parts:
+                # Primary path: inline_data bytes
+                inline = getattr(part, "inline_data", None)
+                if inline is not None:
+                    data = getattr(inline, "data", None)
+                    if data:
+                        mime = getattr(inline, "mime_type", None) or "image/png"
+                        return base64.b64encode(data).decode("utf-8"), mime
+
+                # Fallback: as_image() → PIL Image
+                if hasattr(part, "as_image"):
+                    try:
+                        img = part.as_image()
+                        if img is not None:
+                            buf = io.BytesIO()
+                            img.save(buf, format="PNG")
+                            return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/png"
+                    except Exception as ae:
+                        log_debug(f"as_image() failed: {ae}", _MODULE)
+
+            # No image found — check for text refusal
+            try:
+                text_resp = response.text
+            except Exception:
+                text_resp = None
+
+            if text_resp:
+                last_error = f"Model returned text instead of image: {text_resp[:200]}"
+            else:
+                last_error = "No image data found in response parts."
+            log_error(f"[{map_name}] attempt {attempt}: {last_error}", _MODULE)
+
         except Exception as e:
-            log_error(f"API error for '{map_name}' (attempt {attempt}): {e}", _MODULE, e)
-            last_error = str(e)
+            import traceback
+            err_type = type(e).__name__
+            err_msg  = str(e)
+            log_error(
+                f"[{map_name}] attempt {attempt} [{err_type}]: {err_msg}\n{traceback.format_exc()}",
+                _MODULE, e
+            )
+            last_error = f"{err_type}: {err_msg}"
 
-    # All attempts failed — raise so the pipeline surfaces this to the UI
-    raise RuntimeError(
-        f"Gemini Image API failed for '{map_name}': {last_error or 'no image returned'}"
-    )
+        if attempt < max_attempts:
+            wait = 3.0 * attempt
+            log_debug(f"Retrying '{map_name}' in {wait:.0f}s...", _MODULE)
+            time.sleep(wait)
 
-
-def _log_response_debug(response: dict, map_name: str, attempt: int) -> str:
-    """
-    Log a concise summary of a non-image response and return a short reason string
-    that can be surfaced to the UI.
-    """
-    try:
-        candidates = response.get("candidates", [])
-        if not candidates:
-            feedback = response.get("promptFeedback", {})
-            block = feedback.get("blockReason", "unknown")
-            msg = f"request blocked ({block})"
-            print(f"[NanaBanana::GeminiImageAPI] '{map_name}' attempt {attempt}: "
-                  f"no candidates — blockReason={block}")
-            log_error(f"Generation blocked for '{map_name}': {block}", _MODULE)
-            return msg
-
-        cand = candidates[0]
-        finish = cand.get("finishReason", "?")
-        parts = cand.get("content", {}).get("parts", [])
-        text_parts = [p.get("text", "")[:120] for p in parts if "text" in p]
-        msg = f"finishReason={finish}"
-        print(f"[NanaBanana::GeminiImageAPI] '{map_name}' attempt {attempt}: "
-              f"{msg}, model text={text_parts}")
-        log_error(f"No image for '{map_name}' ({msg})", _MODULE)
-        return msg
-    except Exception:
-        log_error(f"No image in response for '{map_name}' (attempt {attempt}).", _MODULE)
-        return "unexpected response format"
-
-
-def _parse_image_response(response: dict) -> tuple:
-    """
-    Extract inline_data image from a Gemini generateContent response.
-
-    Returns:
-        (base64_str, mime_type) or (None, None).
-    """
-    try:
-        candidates = response.get("candidates", [])
-        if not candidates:
-            return None, None
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        for part in parts:
-            inline = part.get("inline_data")
-            if inline and inline.get("data"):
-                return inline["data"], inline.get("mime_type", "image/png")
-
-        return None, None
-    except (KeyError, IndexError):
-        return None, None
+    raise RuntimeError(f"All attempts failed for '{map_name}': {last_error}")

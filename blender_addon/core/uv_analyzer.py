@@ -82,9 +82,14 @@ def _detect_islands_bmesh(obj) -> Dict[str, Any]:
 
         # Compute UV bounding box for this island
         uvs = []
+        face_polygons = []
         for fi in island_indices:
+            poly = []
             for loop in bm.faces[fi].loops:
-                uvs.append(loop[uv_layer].uv.copy())
+                uv_val = loop[uv_layer].uv
+                uvs.append(uv_val.copy())
+                poly.append((uv_val.x, uv_val.y))
+            face_polygons.append(poly)
 
         if uvs:
             min_u = min(u.x for u in uvs)
@@ -105,6 +110,7 @@ def _detect_islands_bmesh(obj) -> Dict[str, Any]:
             "bounds": {"min": [min_u, min_v], "max": [max_u, max_v]},
             "face_count": len(island_indices),
             "face_indices": island_indices,
+            "face_polygons": face_polygons,
             "symmetrical_to": None,
         })
 

@@ -52,8 +52,9 @@ def get_spec_from_prompt(
     Returns:
         JSON spec dict or None on failure.
     """
-    images = _load_images(uv_layout_path, viewport_image_path)
-
+    # Images are NOT sent to the spec step — text description is sufficient.
+    # Sending large PNG files (UV layout, viewport) caused WriteTimeout errors
+    # because the request body could be several MB.
     user_msg = f"Material description: {user_prompt}"
     if mesh_description:
         user_msg += f"\nMesh analysis: {mesh_description}"
@@ -65,7 +66,7 @@ def get_spec_from_prompt(
         api_key=api_key,
         system_prompt=_SPEC_SYSTEM_PROMPT,
         user_prompt=user_msg,
-        images=images or None,
+        images=None,   # text-only: no large binary uploads
     )
 
     if spec is None:
@@ -85,22 +86,19 @@ def get_mesh_description(
     Ask Gemini 3 Flash to briefly describe the mesh from viewport/UV images.
     Used as extra context to improve texture spec accuracy.
     """
-    images = _load_images(uv_layout_path, viewport_image_path)
-    if not images:
-        return None
-
+    # Skip image sending — text-only approach to avoid WriteTimeout
+    # (UV/viewport PNGs are too large for httpx default write timeout)
     system = (
-        "You are a 3D asset analyst. Given a viewport screenshot and/or UV layout, "
-        "describe in 1-2 sentences what kind of object it is and its surface material. "
-        "Be factual and brief. No markdown."
+        "You are a 3D asset analyst. Describe in 1-2 sentences what kind of 3D object "
+        "typically uses the material described in context. Be factual and brief. No markdown."
     )
-    user = "Analyse the image(s) and describe this 3D mesh object."
+    user = "Briefly describe the likely surface/material type for this 3D mesh."
 
     description = generate_text(
         api_key=api_key,
         system_prompt=system,
         user_prompt=user,
-        images=images,
+        images=None,
         timeout=20.0,
     )
     if description:

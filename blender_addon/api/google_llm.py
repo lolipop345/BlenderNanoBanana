@@ -2,18 +2,18 @@
 BlenderNanoBanana - Gemini 3 Flash API Integration
 
 Calls Gemini 3 Flash with structured outputs (response_mime_type: application/json)
-to generate clean JSON texture parameter specs.
+to generate clean JSON texture parameter specs using the google-genai SDK.
 
 No prose output — only validated JSON matching GEMINI_TEXTURE_SPEC_SCHEMA.
 """
 
 import json
+import base64
+import io
 from typing import Optional, Dict, Any, List
 
-from .api_client import APIClient
 from ..config.constants import (
     GEMINI_MODEL_ID,
-    GEMINI_API_BASE_URL,
     GEMINI_TEXTURE_SPEC_SCHEMA,
 )
 
@@ -21,8 +21,70 @@ from ..utils.logging import log_info, log_debug, log_error
 
 _MODULE = "GeminiLLM"
 
-# Gemini generateContent endpoint
-_ENDPOINT_TEMPLATE = "/v1beta/models/{model}:generateContent"
+_LLM_TIMEOUT_SEC  = 120   # seconds for JSON spec generation
+_TEXT_TIMEOUT_SEC = 120   # seconds for plain-text generation
+
+# Max pixel size for images sent to LLM (compress before upload)
+_MAX_LLM_IMAGE_SIZE = 768
+
+
+def _compress_image_b64(b64_str: str, max_size: int = _MAX_LLM_IMAGE_SIZE) -> tuple:
+    """
+    Resize + JPEG-compress a base64 image.
+    Returns (compressed_b64, mime_type).
+    Falls back to the original PNG on error.
+    """
+    try:
+        from PIL import Image
+        data = base64.b64decode(b64_str)
+        img = Image.open(io.BytesIO(data))
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+    except Exception as e:
+        log_debug(f"Image compression failed (using original): {e}", _MODULE)
+        return b64_str, "image/png"
+
+
+def _make_client(api_key: str, timeout_sec: int):
+    """
+    Create a genai.Client and apply three patches to prevent WriteTimeout:
+
+    1. patch _httpx_client._timeout     → unlimited write/read/pool, 60s connect
+    2. patch _async_httpx_client._timeout → same
+    3. patch _http_options.timeout = None → SDK passes timeout=None to httpx.send(),
+       which then falls back to _timeout (our unlimited value) instead of
+       passing timeout=120 which would override our patch.
+
+    Confirmed working in Blender 4.5 LTS + google-genai 1.70.0 + httpx 0.28.1.
+    """
+    from google import genai
+    import httpx
+
+    # connect=60s, write/read/pool = unlimited (None)
+    hx_no_timeout = httpx.Timeout(timeout=None, connect=60.0)
+
+    client = genai.Client(api_key=api_key, http_options={"timeout": timeout_sec})
+
+    # Patch 1 & 2: httpx client _timeout attributes
+    try:
+        client._api_client._httpx_client._timeout = hx_no_timeout
+    except Exception as e:
+        log_debug(f"Could not patch sync httpx _timeout: {e}", _MODULE)
+
+    try:
+        client._api_client._async_httpx_client._timeout = hx_no_timeout
+    except Exception as e:
+        log_debug(f"Could not patch async httpx _timeout: {e}", _MODULE)
+
+    # Patch 3: _http_options.timeout → None so SDK doesn't override _timeout per-request
+    try:
+        client._api_client._http_options.timeout = None
+    except Exception as e:
+        log_debug(f"Could not patch _http_options.timeout: {e}", _MODULE)
+
+    return client
 
 
 def generate_texture_spec(
@@ -46,23 +108,64 @@ def generate_texture_spec(
     Returns:
         Parsed JSON dict matching the texture spec schema, or None on failure.
     """
-    client = APIClient(api_key=api_key, base_url=GEMINI_API_BASE_URL)
-    endpoint = _ENDPOINT_TEMPLATE.format(model=GEMINI_MODEL_ID)
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("google-genai is not installed yet. Please wait for dependencies to install.")
 
-    payload = _build_payload(system_prompt, user_prompt, images)
+    client = _make_client(api_key, _LLM_TIMEOUT_SEC)
 
-    log_debug(f"Calling Gemini 3 Flash ({GEMINI_MODEL_ID})...", _MODULE)
+    parts = [user_prompt]
+    if images:
+        for img in images:
+            compressed_b64, mime = _compress_image_b64(img["data"])
+            parts.append(
+                types.Part.from_bytes(
+                    data=base64.b64decode(compressed_b64),
+                    mime_type=mime,
+                )
+            )
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        response_mime_type="application/json",
+        response_schema=GEMINI_TEXTURE_SPEC_SCHEMA,
+    )
+
+    log_debug(f"Calling Gemini ({GEMINI_MODEL_ID}) for texture spec...", _MODULE)
 
     try:
-        response = client.post_json(endpoint, payload, timeout=30.0)
-        spec = _parse_response(response)
-        if spec:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL_ID,
+            contents=parts,
+            config=config,
+        )
+        if response.text:
+            text = response.text.strip()
+            # Strip markdown code fences if present
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+            spec = json.loads(text)
             log_info(f"Gemini spec generated: {list(spec.keys())}", _MODULE)
-        return spec
+            return spec
+        log_error("Gemini returned no text for spec.", _MODULE)
+        return None
     except Exception as e:
-        # Re-raise so the caller can surface a real error message to the UI
-        log_error(f"Gemini API call failed: {e}", _MODULE, e)
-        raise RuntimeError(f"Gemini Flash API error: {e}") from e
+        import traceback
+        err_type = type(e).__name__
+        err_msg = str(e)
+        log_error(
+            f"Gemini API call failed ({err_type}): {err_msg}\n{traceback.format_exc()}",
+            _MODULE, e
+        )
+        raise RuntimeError(f"Gemini Flash API error ({err_type}): {err_msg}") from e
 
 
 def generate_text(
@@ -85,99 +188,43 @@ def generate_text(
     Returns:
         Response text string, or None on failure.
     """
-    client = APIClient(api_key=api_key, base_url=GEMINI_API_BASE_URL)
-    endpoint = _ENDPOINT_TEMPLATE.format(model=GEMINI_MODEL_ID)
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("google-genai is not installed yet. Please wait for dependencies to install.")
 
-    parts = [{"text": user_prompt}]
+    t_sec = max(int(timeout), _TEXT_TIMEOUT_SEC)
+    client = _make_client(api_key, t_sec)
+
+    parts = [user_prompt]
     if images:
         for img in images:
-            parts.append({
-                "inline_data": {
-                    "mime_type": img["mime_type"],
-                    "data": img["data"],
-                }
-            })
+            compressed_b64, mime = _compress_image_b64(img["data"])
+            parts.append(
+                types.Part.from_bytes(
+                    data=base64.b64decode(compressed_b64),
+                    mime_type=mime,
+                )
+            )
 
-    payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": parts}],
-    }
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+    )
 
-    log_debug(f"Calling Gemini 3 Flash (text, {GEMINI_MODEL_ID})...", _MODULE)
+    log_debug(f"Calling Gemini ({GEMINI_MODEL_ID}) for text...", _MODULE)
 
     try:
-        response = client.post_json(endpoint, payload, timeout=timeout)
-        candidates = response.get("candidates", [])
-        if not candidates:
-            return None
-        parts_resp = candidates[0].get("content", {}).get("parts", [])
-        return parts_resp[0].get("text", "") if parts_resp else None
+        response = client.models.generate_content(
+            model=GEMINI_MODEL_ID,
+            contents=parts,
+            config=config,
+        )
+        return response.text
     except Exception as e:
-        log_error(f"Gemini text call failed: {e}", _MODULE, e)
-        return None
-
-
-def _build_payload(system_prompt: str, user_prompt: str,
-                   images: Optional[List[Dict[str, str]]]) -> dict:
-    """Build the Gemini API request payload with structured output config."""
-    # User content parts
-    parts = [{"text": user_prompt}]
-
-    # Add images as inline_data parts
-    if images:
-        for img in images:
-            parts.append({
-                "inline_data": {
-                    "mime_type": img["mime_type"],
-                    "data": img["data"],
-                }
-            })
-
-    return {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": parts,
-            }
-        ],
-        "generationConfig": {
-            # Force JSON output — no prose, no markdown
-            "response_mime_type": "application/json",
-            "response_schema": GEMINI_TEXTURE_SPEC_SCHEMA,
-            # temperature intentionally omitted — Gemini 3 docs strongly recommend
-            # keeping it at the default (1.0); lowering it causes looping/degraded output
-        },
-    }
-
-
-def _parse_response(response: dict) -> Optional[Dict[str, Any]]:
-    """Extract and parse the JSON spec from a Gemini API response."""
-    try:
-        candidates = response.get("candidates", [])
-        if not candidates:
-            log_error("Gemini returned no candidates.", _MODULE)
-            return None
-
-        content = candidates[0].get("content", {})
-        parts = content.get("parts", [])
-        if not parts:
-            log_error("Gemini response has no content parts.", _MODULE)
-            return None
-
-        text = parts[0].get("text", "")
-        if not text:
-            log_error("Gemini response text is empty.", _MODULE)
-            return None
-
-        spec = json.loads(text)
-        return spec
-
-    except json.JSONDecodeError as e:
-        log_error(f"Failed to parse Gemini JSON response: {e}", _MODULE)
-        return None
-    except (KeyError, IndexError) as e:
-        log_error(f"Unexpected Gemini response structure: {e}", _MODULE)
+        import traceback
+        log_error(
+            f"Gemini text call failed: {e}\n{traceback.format_exc()}",
+            _MODULE, e
+        )
         return None

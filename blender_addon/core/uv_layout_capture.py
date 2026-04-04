@@ -87,7 +87,8 @@ def annotate_uv_layout(
     island_tags: Dict[str, str],
 ) -> bool:
     """
-    Draw island ID + material tag labels onto the exported UV layout image.
+    Draw island ID + material tag labels onto the exported UV layout image,
+    and fill the UV island polygons with distinct colors per material tag!
 
     Uses Pillow (PIL). If Pillow is not installed this function returns False
     and the image is left unchanged.
@@ -95,7 +96,6 @@ def annotate_uv_layout(
     Args:
         image_path: Path to the PNG file to annotate (modified in-place)
         islands:    Island list from nb_uv_analysis["islands"]
-                    Each island has {"id": str, "center": [u, v], ...}
         island_tags: Dict of island_id → tag string
 
     Returns:
@@ -108,24 +108,65 @@ def annotate_uv_layout(
         return False
 
     try:
+        # Load the raw wireframe exported from Blender
         img = Image.open(image_path).convert("RGBA")
-        draw = ImageDraw.Draw(img)
         img_w, img_h = img.size
+
+        # Create a blank image for filled polygons (drawn BEHIND the wireframe)
+        poly_img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+        poly_draw = ImageDraw.Draw(poly_img)
+
+        # Palette of distinct RGBA colors (with 180 alpha for visibility)
+        palette = [
+            (255, 75, 75, 180),   # Red
+            (75, 200, 75, 180),   # Green
+            (75, 125, 255, 180),  # Blue
+            (255, 200, 50, 180),  # Yellow
+            (240, 100, 240, 180), # Magenta
+            (50, 210, 210, 180),  # Cyan
+            (255, 150, 50, 180),  # Orange
+            (180, 100, 255, 180), # Purple
+            (180, 255, 75, 180),  # Lime
+            (255, 150, 150, 180), # Pink
+            (120, 180, 255, 180), # Light Blue
+            (210, 210, 120, 180), # Khaki
+        ]
+        
+        # Map unique tags to palette colors
+        unique_tags = list(sorted(set(t for t in island_tags.values() if t)))
+        tag_colors = {tag: palette[i % len(palette)] for i, tag in enumerate(unique_tags)}
+        base_color = (100, 100, 100, 80) # Grey for untagged
+
+        # 1. Draw polygons
+        for island in islands:
+            iid = island.get("id", "?")
+            tag_name = island_tags.get(iid, "")
+            color = tag_colors.get(tag_name, base_color)
+            
+            for poly in island.get("face_polygons", []):
+                # (u, v) -> (x, y) where Y is inverted
+                px_coords = [(int(u * img_w), int((1.0 - v) * img_h)) for u, v in poly]
+                if len(px_coords) >= 3:
+                    poly_draw.polygon(px_coords, fill=color)
+
+        # Composite wireframe over the filled polygons
+        out_img = Image.alpha_composite(poly_img, img)
+        draw = ImageDraw.Draw(out_img)
 
         # Try to get a readable font; fall back to default bitmap font
         font_label = font_tag = None
         try:
-            font_label = ImageFont.truetype("arial.ttf", 13)
-            font_tag   = ImageFont.truetype("arial.ttf", 11)
+            font_label = ImageFont.truetype("arial.ttf", 15)
+            font_tag   = ImageFont.truetype("arial.ttf", 13)
         except Exception:
             font_label = ImageFont.load_default()
             font_tag   = font_label
 
+        # 2. Draw text labels on top
         for island in islands:
             iid    = island.get("id", "?")
             center = island.get("center", [0.5, 0.5])
 
-            # UV (0,0) = bottom-left in Blender, but image (0,0) = top-left
             px = int(center[0] * img_w)
             py = int((1.0 - center[1]) * img_h)
 
@@ -133,33 +174,36 @@ def annotate_uv_layout(
             label_line1 = iid
             label_line2 = tag if tag else ""
 
-            # Measure text width for background rectangle
             w1 = _text_width(draw, label_line1, font_label)
             w2 = _text_width(draw, label_line2, font_tag) if label_line2 else 0
-            box_w = max(w1, w2) + 8
-            box_h = 14 + (13 if label_line2 else 0) + 4
+            box_w = max(w1, w2) + 12
+            box_h = 16 + (16 if label_line2 else 0) + 6
 
-            # Background box (semi-transparent dark)
-            bx0, by0 = px - 2, py - 2
+            # Background box
+            bx0, by0 = px - 4, py - 4
             bx1, by1 = bx0 + box_w, by0 + box_h
-            draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 180))
+            draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 200), outline=(255, 255, 255, 100))
 
-            # Island ID in white
-            draw.text((px + 2, py), label_line1, fill=(255, 255, 255, 255), font=font_label)
+            # Island ID text
+            draw.text((px + 2, py - 2), label_line1, fill=(255, 255, 255, 255), font=font_label)
 
-            # Tag in yellow (if present)
+            # Tag text
             if label_line2:
-                draw.text((px + 2, py + 14), label_line2, fill=(255, 220, 0, 255), font=font_tag)
+                # Use the tag color for the text too, to make it super obvious
+                text_col = tag_colors.get(tag, (255, 220, 0, 255))
+                # Boost alpha to max for text
+                text_col = (text_col[0], text_col[1], text_col[2], 255)
+                draw.text((px + 2, py + 14), label_line2, fill=text_col, font=font_tag)
 
-            # Small dot at the centroid
-            draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=(0, 220, 255, 220))
+            # Small center dot
+            draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=(0, 255, 255, 255))
 
-        img.save(image_path, "PNG")
-        log_debug(f"UV layout annotated with {len(islands)} island label(s).", _MODULE)
+        out_img.save(image_path, "PNG")
+        log_debug(f"UV layout annotated with {len(islands)} colored island(s).", _MODULE)
         return True
 
     except Exception as e:
-        log_error(f"UV layout annotation failed: {e}", _MODULE, e)
+        log_error(f"UV layout coloring failed: {e}", _MODULE, e)
         return False
 
 

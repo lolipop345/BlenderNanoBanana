@@ -3,12 +3,16 @@ BlenderNanoBanana - Preview / Thumbnail Manager
 
 Manages a bpy.utils.previews ImagePreviewCollection for displaying
 generated texture map thumbnails in the N-tab panels and Image Editor.
+
+Blender 4.x compatibility: bpy.utils.previews must be explicitly imported.
 """
 
 import os
 from typing import Dict, Optional
 
 import bpy
+# Blender 4.x requires explicit import of the previews sub-module
+import bpy.utils.previews as _bpy_previews
 
 _pcoll = None
 
@@ -17,7 +21,7 @@ def get_preview_collection():
     """Return the active preview collection, creating it if needed."""
     global _pcoll
     if _pcoll is None:
-        _pcoll = bpy.utils.previews.new()
+        _pcoll = _bpy_previews.new()
     return _pcoll
 
 
@@ -45,22 +49,28 @@ def load_map_previews(map_paths: Dict[str, str]):
 
 def get_icon_id(map_name: str) -> Optional[int]:
     """Return the icon_value for a map name, or None if not loaded."""
-    pcoll = get_preview_collection()
-    key = f"nb_{map_name}"
-    if key in pcoll:
-        return pcoll[key].icon_id
+    try:
+        pcoll = get_preview_collection()
+        key = f"nb_{map_name}"
+        if key in pcoll:
+            return pcoll[key].icon_id
+    except Exception:
+        pass
     return None
 
 
 def get_all_icon_ids() -> Dict[str, int]:
     """Return {map_name: icon_id} for all loaded previews."""
-    pcoll = get_preview_collection()
-    result = {}
-    for key, preview in pcoll.items():
-        if key.startswith("nb_"):
-            map_name = key[3:]  # strip "nb_" prefix
-            result[map_name] = preview.icon_id
-    return result
+    try:
+        pcoll = get_preview_collection()
+        result = {}
+        for key, preview in pcoll.items():
+            if key.startswith("nb_"):
+                map_name = key[3:]  # strip "nb_" prefix
+                result[map_name] = preview.icon_id
+        return result
+    except Exception:
+        return {}
 
 
 def clear():
@@ -72,11 +82,11 @@ def clear():
 
 def register():
     global _pcoll
-    _pcoll = bpy.utils.previews.new()
+    _pcoll = _bpy_previews.new()
 
 
 def unregister():
     global _pcoll
     if _pcoll is not None:
-        bpy.utils.previews.remove(_pcoll)
+        _bpy_previews.remove(_pcoll)
         _pcoll = None
