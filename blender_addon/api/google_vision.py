@@ -246,23 +246,23 @@ def generate_uv_atlas_map(
     # ── Build the prompt ──────────────────────────────────────────────────────
     if island_material_desc:
         island_section = (
-            f"UV island material assignments: {island_material_desc}. "
-            "Each entry is: islandID(orientation)=MaterialName. "
-            "Apply the specified material texture to each corresponding UV island area "
-            "shown in the wireframe image. "
+            f"ROTATION/ORIENTATION RULES:\n{island_material_desc}\n"
+            "Each entry specifies if an island is rotated (e.g., rotated_CW_90deg). You must draw the texture rotated by that amount inside the island polygon so it maps upright on the 3D model! 'upright' means draw normally.\n\n"
+            "MANDATORY VISUAL INSTRUCTIONS:\n"
+            "1. The reference image is a black-and-white wireframe layout. Material tags (like 'Face', 'Metal', etc.) are written clearly in WHITE text right on top of their target polygons.\n"
+            "2. You MUST paint the specified material strictly inside the exact polygon where its name is written.\n"
+            "3. DO NOT draw a 'Face' or any text material anywhere unless the word is unmistakably written on that island!\n"
+            "4. DO NOT paint outside the wireframe shapes! All black background space MUST remain completely plain black/empty.\n"
+            "5. Maintain natural proportions within the polygons. Do not stretch textures awkwardly.\n"
         )
     else:
         island_section = ""
 
     prompt = (
-        f"Generate a high-quality {map_desc} UV texture atlas for a 3D character mesh. "
-        f"Overall context: {base_prompt}. "
-        f"{island_section}"
-        "The reference image shows the UV island wireframe layout in the 0-1 UV space. "
-        "Paint each UV island with the correct material. "
-        "Areas outside UV islands (black space) should remain dark/empty. "
-        "Do NOT show the wireframe lines in the output — only the texture content. "
-        "Do NOT include any text, labels, watermarks, or UI elements. "
+        f"Generate a high-quality {map_desc} UV texture atlas for a 3D character mesh.\n"
+        f"Overall context: {base_prompt}.\n\n"
+        f"{island_section}\n"
+        "DO NOT reproduce the 'uv_xxx', material labels, text, wireframe lines, or UI elements in the final output texture. Just the raw PBR materials.\n"
         "Full 1:1 square aspect ratio. Professional PBR game asset quality."
     )
 

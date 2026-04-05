@@ -219,21 +219,23 @@ def _text_width(draw, text: str, font) -> int:
         return w
 
 
-def annotate_uv_with_ids(
+def annotate_uv_with_tags(
     image_path: str,
     islands: List[Dict],
+    island_tags: Dict[str, str],
 ) -> bool:
     """
-    Stamp each UV island with ONLY its short ID label (e.g. "uv_025").
+    Stamp each UV island with its material tag (e.g. 'Face') and ID.
 
-    No colors. No material tags. No polygon fills. No debug boxes.
-    Just a small white text label at each island's centroid so that Gemini
-    can match the label to the mesh region when it reads the text prompt
-    ("uv_025=Metal, uv_013=Skin, ...").
+    No bright colors. No polygon fills. No debug boxes.
+    Just a white text label at each island's centroid so that Gemini
+    can see EXACTLY where to paint which material, without getting
+    biased by solid color masks.
 
     Args:
         image_path: Path to the UV wireframe PNG (modified in-place).
         islands:    Island list from nb_uv_analysis["islands"].
+        island_tags: Mapping of island IDs to material names.
 
     Returns True on success, False if Pillow unavailable or error.
     """
@@ -248,41 +250,59 @@ def annotate_uv_with_ids(
         draw = ImageDraw.Draw(img)
         img_w, img_h = img.size
 
-        # Small but legible font
+        # Larger clear font for the semantic tag
         try:
-            font = ImageFont.truetype("arial.ttf", 11)
+            font_tag = ImageFont.truetype("arial.ttf", 14)
+            font_id = ImageFont.truetype("arial.ttf", 10)
         except Exception:
-            font = ImageFont.load_default()
+            font_tag = ImageFont.load_default()
+            font_id = font_tag
 
         for island in islands:
             iid    = island.get("id", "?")
-            # label_center is guaranteed inside a real face polygon (not just bbox midpoint)
-            center = island.get("label_center", island.get("bbox_center", island.get("center", [0.5, 0.5])))
+            tag    = island_tags.get(iid)
+            
+            # If no tag assigned, don't clutter the image
+            if not tag:
+                continue
+
+            center = (
+                island.get("label_center")
+                or island.get("bbox_center")
+                or island.get("center", [0.5, 0.5])
+            )
 
             # UV → image pixel coords (Y-flip)
             cx = int(center[0] * img_w)
             cy = int((1.0 - center[1]) * img_h)
 
-            tw = _text_width(draw, iid, font)
-            th = 11  # approximate text height for small font
+            tw_tag = _text_width(draw, tag, font_tag)
+            th_tag = 14
+            tw_id = _text_width(draw, iid, font_id)
+            th_id = 10
+            
+            box_w = max(tw_tag, tw_id) + 4
+            box_h = th_tag + th_id + 6
 
-            # Center text on the island centroid (not top-left aligned)
-            tx = cx - tw // 2
-            ty = cy - th // 2
+            tx = cx - box_w // 2
+            ty = cy - box_h // 2
 
-            # Tiny semi-transparent black backing so text is readable on white wireframe
+            # Solid dark backing so it's impossible to miss
             draw.rectangle(
-                [tx - 2, ty - 1, tx + tw + 2, ty + th + 1],
-                fill=(0, 0, 0, 180),
+                [tx, ty, tx + box_w, ty + box_h],
+                fill=(0, 0, 0, 255),
+                outline=(255, 255, 255, 180)
             )
-            # White label text, centered on island
-            draw.text((tx, ty), iid, fill=(255, 255, 255, 255), font=font)
+            # Bright white text for the semantic tag!
+            draw.text((cx - tw_tag // 2, ty + 2), tag, fill=(255, 255, 255, 255), font=font_tag)
+            # Dimmer text for IID
+            draw.text((cx - tw_id // 2, ty + th_tag + 4), iid, fill=(200, 200, 200, 200), font=font_id)
 
         img.save(image_path, "PNG")
-        log_debug(f"UV layout stamped with {len(islands)} ID label(s).", _MODULE)
+        log_debug(f"UV layout stamped with {len(islands)} tag label(s).", _MODULE)
         return True
 
     except Exception as e:
-        log_error(f"UV ID annotation failed: {e}", _MODULE, e)
+        log_error(f"UV tag annotation failed: {e}", _MODULE, e)
         return False
 

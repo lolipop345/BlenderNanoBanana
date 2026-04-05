@@ -188,12 +188,14 @@ def run_generation_pipeline(
 
 def _build_island_desc(island_data: List[Dict], island_tags: Dict[str, str]) -> str:
     """
-    Build a concise human-readable description of each UV island and its material.
+    Build a strict, unambiguous description of each tagged UV island's orientation.
+
+    Uses exact degree values so Gemini can orient textures correctly.
 
     Example output:
-      "uv_001(top-left,small)=Metal; uv_002(center,large)=Skin; uv_003(bottom-right,medium)=Wood"
+      "uv_001(upright)=Metal; uv_002(rotated_CW_90deg)=Skin; uv_003(mirrored_rotated_CCW_45deg)=Wood"
 
-    The position hints help Gemini correlate text descriptions to the UV wireframe.
+    Positive rotation = CW as seen in the UV layout image.
     """
     if not island_data or not island_tags:
         return ""
@@ -205,30 +207,51 @@ def _build_island_desc(island_data: List[Dict], island_tags: Dict[str, str]) -> 
         if not tag:
             continue
 
-        # Only rotation/flip matters — position and size are visible in the UV wireframe image
         rot     = island.get("rotation_deg", 0.0)
         flipped = island.get("is_flipped", False)
-
-        if flipped and abs(rot) < 15:
-            orient = "mirrored"
-        elif flipped:
-            orient = f"mirrored_rot{rot:+.0f}deg"
-        elif rot > 135 or rot < -135:
-            orient = "upside-down"
-        elif 45 < rot <= 135:
-            orient = "tilted-right-90deg"
-        elif -135 <= rot < -45:
-            orient = "tilted-left-90deg"
-        elif 15 < rot <= 45:
-            orient = "slightly-tilted-right"
-        elif -45 <= rot < -15:
-            orient = "slightly-tilted-left"
-        else:
-            orient = "upright"
-
+        orient  = _orient_label(rot, flipped)
+        
         parts.append(f"{iid}({orient})={tag}")
 
     return "; ".join(parts)
+
+
+def _orient_label(rot: float, flipped: bool) -> str:
+    """
+    Return a strict, unambiguous orientation string for a UV island.
+
+    Args:
+        rot:     Rotation in degrees, positive = CW as seen in the UV layout image.
+        flipped: True if the island has CW winding (mirrored geometry).
+
+    Examples:
+        ( 0.0, False) → "upright"
+        (90.0, False) → "rotated_CW_90deg"
+        (-45.0, False) → "rotated_CCW_45deg"
+        (180.0, False) → "upside_down"
+        ( 0.0, True)  → "mirrored"
+        (90.0, True)  → "mirrored_rotated_CW_90deg"
+    """
+    UPRIGHT_THRESH = 8.0  # degrees — below this, treat as upright
+
+    rot_abs = abs(rot)
+    is_upside_down = rot_abs > 172.0  # ±180° ± 8° tolerance
+
+    if flipped:
+        if is_upside_down:
+            return "mirrored_upside_down"
+        if rot_abs < UPRIGHT_THRESH:
+            return "mirrored"
+        direction = "CW" if rot > 0 else "CCW"
+        return f"mirrored_rotated_{direction}_{rot_abs:.0f}deg"
+
+    if is_upside_down:
+        return "upside_down"
+    if rot_abs < UPRIGHT_THRESH:
+        return "upright"
+
+    direction = "CW" if rot > 0 else "CCW"
+    return f"rotated_{direction}_{rot_abs:.0f}deg"
 
 
 def _load_and_compress_uv(uv_layout_path: Optional[str]) -> Optional[str]:

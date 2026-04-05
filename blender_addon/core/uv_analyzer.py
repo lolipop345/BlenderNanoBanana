@@ -216,12 +216,15 @@ def _compute_rotation_from_3d(bm, island_indices, uv_layer) -> Optional[float]:
             return None
             
     # Angle of the "up" gradient measured from +V (UV-up axis).
-    # Using atan2(dv, du) gives angle from +U; subtracting from 90 converts to angle from +V.
-    # Sign convention: positive = CW = tilted-right, negative = CCW = tilted-left.
-    # NOTE: negated vs the naive 90-angle formula because in the exported UV PNG the
-    # gradient direction and the visual tilt direction are opposite (empirically confirmed).
+    # atan2(dv, du) gives the angle from +U axis.
+    # Subtracting from 90 converts to "degrees CW from upright as seen on screen":
+    #   gradient in +V  (up in UV / up on screen) → angle=90°  → rot=  0° (upright)
+    #   gradient in +U  (right in UV)              → angle= 0°  → rot=+90° (CW on screen)
+    #   gradient in -U  (left in UV)               → angle=180° → rot=-90° (CCW on screen)
+    #   gradient in -V  (down in UV)               → angle=-90° → rot=±180° (upside-down)
+    # Sign convention: positive rot = CW on screen = tilted-right.
     angle = math.atan2(best_dv, best_du)
-    rot_deg = math.degrees(angle) - 90.0
+    rot_deg = 90.0 - math.degrees(angle)
 
     while rot_deg > 180.0: rot_deg -= 360.0
     while rot_deg < -180.0: rot_deg += 360.0

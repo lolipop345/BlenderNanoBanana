@@ -107,14 +107,16 @@ class NANOBANANA_OT_generate_textures(Operator):
         uv_layout_out  = os.path.join(cache_base, project_name, uv_region_id, "uv_layout.png")
         uv_layout_path = capture_uv_layout(context, uv_layout_out)
 
-        # Stamp each UV island with ONLY its ID (e.g. "uv_025") — no colors, no tags
-        # Gemini will match these IDs to the material list in the text prompt
+        # Write material tags directly onto the black-and-white UV wireframe.
+        # This acts as an undefeatable visual guide for Vision models without color bleed.
         if uv_layout_path:
             uv_data = context.scene.get("nb_uv_analysis")
             if uv_data:
-                annotate_uv_with_ids(
+                from ..core.uv_layout_capture import annotate_uv_with_tags
+                annotate_uv_with_tags(
                     image_path=uv_layout_path,
                     islands=uv_data.get("islands", []),
+                    island_tags=island_tags,
                 )
 
         # Extract UV island data on main thread (can't access bpy.context from background)
