@@ -1,3 +1,6 @@
 .claude
 *.zip
 *.7z
+.DS_Store
+.env
+__pycache__
