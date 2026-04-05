@@ -54,43 +54,49 @@ def _compress_b64(b64_str: str, max_size: int = 512) -> str:
         return b64_str
 
 
-def _make_client(api_key: str, timeout_sec: int):
+def _make_client(api_key: str, timeout_sec: int = 120):
     """
-    Create a genai.Client and apply three patches to prevent WriteTimeout:
+    Create a genai.Client with patched httpx timeouts.
 
-    1. patch _httpx_client._timeout
-    2. patch _async_httpx_client._timeout
-    3. patch _http_options.timeout = None
-
-    Using 300s for write/read instead of None to prevent infinite hangs if the
-    API server fails to respond.
+    The default httpx write timeout (~5s) is too short for uploading UV wireframe
+    images, causing WriteTimeout errors.  We set write/read to 120s while keeping
+    connect at 30s, and clear _http_options.timeout so the SDK does not override
+    the patched values on each request.
     """
     from google import genai
     import httpx
 
-    # connect=60s, write/read/pool = 300s (prevent 40-minute infinite hangs)
-    hx_no_timeout = httpx.Timeout(timeout=300.0, connect=60.0)
-
     client = genai.Client(api_key=api_key, http_options={"timeout": timeout_sec})
 
-    # Patch 1 & 2: httpx client _timeout attributes
+    hx_timeout = httpx.Timeout(timeout=120.0, connect=30.0)
+
     try:
-        client._api_client._httpx_client._timeout = hx_no_timeout
+        client._api_client._httpx_client._timeout = hx_timeout
     except Exception as e:
         log_debug(f"Could not patch sync httpx _timeout: {e}", _MODULE)
 
     try:
-        client._api_client._async_httpx_client._timeout = hx_no_timeout
+        client._api_client._async_httpx_client._timeout = hx_timeout
     except Exception as e:
         log_debug(f"Could not patch async httpx _timeout: {e}", _MODULE)
 
-    # Patch 3: _http_options.timeout → None so SDK doesn't override _timeout per-request
     try:
         client._api_client._http_options.timeout = None
     except Exception as e:
         log_debug(f"Could not patch _http_options.timeout: {e}", _MODULE)
 
     return client
+
+
+def make_shared_client(api_key: str):
+    """
+    Create a single genai.Client to be reused across all parallel map calls.
+
+    httpx.Client (which backs genai.Client) is thread-safe for concurrent
+    requests, so sharing one instance avoids the overhead of opening N separate
+    connection pools when generating N maps in parallel.
+    """
+    return _make_client(api_key)
 
 
 def generate_textures(
@@ -214,6 +220,7 @@ def generate_uv_atlas_map(
     island_material_desc: str,
     uv_wireframe_b64: Optional[str],
     map_cfg: Dict[str, Any],
+    client=None,
 ) -> tuple:
     """
     Generate ONE UV atlas map (e.g. albedo) in a single Gemini Image API call.
@@ -232,14 +239,15 @@ def generate_uv_atlas_map(
     except ImportError:
         raise RuntimeError("google-genai not installed.")
 
-    client = _make_client(api_key, GEMINI_IMAGE_TIMEOUT)
+    if client is None:
+        client = _make_client(api_key)
     map_desc = _MAP_PROMPTS.get(map_name, f"{map_name} texture map")
 
     # ── Build the prompt ──────────────────────────────────────────────────────
     if island_material_desc:
         island_section = (
             f"UV island material assignments: {island_material_desc}. "
-            "Each entry is: islandID(position,size)=MaterialName. "
+            "Each entry is: islandID(orientation)=MaterialName. "
             "Apply the specified material texture to each corresponding UV island area "
             "shown in the wireframe image. "
         )
@@ -444,11 +452,27 @@ def _call_image_api_with_retry(
             )
 
             if not response.candidates:
-                last_error = "API returned no candidates."
-                log_error(f"No candidates for '{map_name}' (attempt {attempt})", _MODULE)
+                # Check if the prompt was blocked before generation
+                try:
+                    fb = response.prompt_feedback
+                    block = getattr(fb, "block_reason", None)
+                    if block:
+                        last_error = f"Prompt blocked by safety filter: {block}"
+                        log_error(f"[{map_name}] {last_error}", _MODULE)
+                        raise RuntimeError(last_error)  # no point retrying a blocked prompt
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+                last_error = "API returned no candidates (possible safety block or quota)."
+                log_error(f"[{map_name}] attempt {attempt}: {last_error}", _MODULE)
                 continue
 
-            for part in response.candidates[0].content.parts:
+            candidate = response.candidates[0]
+            finish_reason = str(getattr(candidate, "finish_reason", "UNKNOWN"))
+            log_info(f"[{map_name}] finish_reason={finish_reason}", _MODULE)
+
+            for part in candidate.content.parts:
                 # Primary path: inline_data bytes
                 inline = getattr(part, "inline_data", None)
                 if inline is not None:
@@ -468,16 +492,17 @@ def _call_image_api_with_retry(
                     except Exception as ae:
                         log_debug(f"as_image() failed: {ae}", _MODULE)
 
-            # No image found — check for text refusal
+            # No image found — log text response + finish reason
             try:
                 text_resp = response.text
             except Exception:
                 text_resp = None
 
             if text_resp:
-                last_error = f"Model returned text instead of image: {text_resp[:200]}"
+                last_error = f"finish={finish_reason} — model returned text: {text_resp[:300]}"
             else:
-                last_error = "No image data found in response parts."
+                part_types = [type(p).__name__ for p in candidate.content.parts]
+                last_error = f"finish={finish_reason} — no image in parts: {part_types}"
             log_error(f"[{map_name}] attempt {attempt}: {last_error}", _MODULE)
 
         except Exception as e:

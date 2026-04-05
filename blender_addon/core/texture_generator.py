@@ -102,7 +102,12 @@ def run_generation_pipeline(
 
     _p(0.06, f"Generating {total_maps} UV atlas maps in parallel...")
 
+    # Create ONE shared client — avoids N separate httpx connection pools
+    from ..api.google_vision import make_shared_client
+    shared_client = make_shared_client(api_key)
+
     results: Dict[str, str] = {}  # map_name → base64
+    map_errors: Dict[str, str] = {}
 
     def gen_map(map_name: str):
         if _cancel_flag.is_set():
@@ -115,6 +120,7 @@ def run_generation_pipeline(
                 island_material_desc=island_material_desc,
                 uv_wireframe_b64=uv_wireframe_b64,
                 map_cfg=engine_map_specs.get(map_name, {}),
+                client=shared_client,
             )
             return map_name, image_b64, None
         except Exception as e:
@@ -128,8 +134,10 @@ def run_generation_pipeline(
                 completed += 1
                 frac = 0.06 + (completed / total_maps) * 0.84
             if err:
-                log_error(f"Failed [{map_name}]: {err}", _MODULE)
-                _p(frac, f"✗ {map_name}")
+                err_str = str(err)
+                map_errors[map_name] = err_str
+                log_error(f"Failed [{map_name}]: {err_str}", _MODULE)
+                _p(frac, f"✗ {map_name}: {err_str[:80]}")
             elif b64:
                 results[map_name] = b64
                 _p(frac, f"✓ {map_name} ({completed}/{total_maps})")
@@ -138,7 +146,9 @@ def run_generation_pipeline(
         return None
 
     if not results:
-        raise RuntimeError("Gemini Image API returned no images for any map type.")
+        # Surface the actual per-map errors so the user sees what went wrong
+        details = "; ".join(f"{k}: {v[:120]}" for k, v in map_errors.items())
+        raise RuntimeError(f"No images generated. Errors — {details}")
 
     # ── 5. Save maps ──────────────────────────────────────────────────────────
     _p(0.91, "Saving maps...")
@@ -195,19 +205,28 @@ def _build_island_desc(island_data: List[Dict], island_tags: Dict[str, str]) -> 
         if not tag:
             continue
 
-        bounds = island.get("bounds", {})
-        min_u, min_v = bounds.get("min", [0.5, 0.5])
-        max_u, max_v = bounds.get("max", [0.5, 0.5])
-        cu = (min_u + max_u) / 2
-        cv = (min_v + max_v) / 2
-        area = island.get("area", 0.0)
+        # Only rotation/flip matters — position and size are visible in the UV wireframe image
+        rot     = island.get("rotation_deg", 0.0)
+        flipped = island.get("is_flipped", False)
 
-        # Human-readable position
-        h = "left" if cu < 0.35 else ("right" if cu > 0.65 else "center")
-        v = "top"  if cv > 0.65 else ("bottom" if cv < 0.35 else "middle")
-        size = "small" if area < 0.01 else ("large" if area > 0.08 else "medium")
+        if flipped and abs(rot) < 15:
+            orient = "mirrored"
+        elif flipped:
+            orient = f"mirrored_rot{rot:+.0f}deg"
+        elif rot > 135 or rot < -135:
+            orient = "upside-down"
+        elif 45 < rot <= 135:
+            orient = "tilted-right-90deg"
+        elif -135 <= rot < -45:
+            orient = "tilted-left-90deg"
+        elif 15 < rot <= 45:
+            orient = "slightly-tilted-right"
+        elif -45 <= rot < -15:
+            orient = "slightly-tilted-left"
+        else:
+            orient = "upright"
 
-        parts.append(f"{iid}({v}-{h},{size})={tag}")
+        parts.append(f"{iid}({orient})={tag}")
 
     return "; ".join(parts)
 
@@ -223,7 +242,7 @@ def _load_and_compress_uv(uv_layout_path: Optional[str]) -> Optional[str]:
         import io
         from PIL import Image
         img = Image.open(uv_layout_path).convert("RGB")
-        img.thumbnail((768, 768))
+        img.thumbnail((512, 512))
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=88, optimize=True)
         return base64.b64encode(buf.getvalue()).decode("utf-8")

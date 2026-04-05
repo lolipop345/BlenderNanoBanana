@@ -11,7 +11,7 @@ GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
 
 # Gemini 3.1 Flash Image - Texture / Reference Image Generator
 GEMINI_IMAGE_MODEL_ID = "gemini-3.1-flash-image-preview"
-GEMINI_IMAGE_TIMEOUT = 300      # seconds — image generation can take 3-5 min
+GEMINI_IMAGE_TIMEOUT = 120      # seconds
 GEMINI_IMAGE_RETRY_COUNT = 2    # fewer retries since each attempt is slow
 GEMINI_IMAGE_RETRY_DELAY = 2.0  # seconds
 

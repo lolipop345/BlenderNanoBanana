@@ -166,7 +166,7 @@ def annotate_uv_layout(
         # 2. Draw text labels on top
         for island in islands:
             iid    = island.get("id", "?")
-            center = island.get("center", [0.5, 0.5])
+            center = island.get("label_center", island.get("bbox_center", island.get("center", [0.5, 0.5])))
 
             px = int(center[0] * img_w)
             py = int((1.0 - center[1]) * img_h)
@@ -256,10 +256,10 @@ def annotate_uv_with_ids(
 
         for island in islands:
             iid    = island.get("id", "?")
-            center = island.get("center", [0.5, 0.5])
+            # label_center is guaranteed inside a real face polygon (not just bbox midpoint)
+            center = island.get("label_center", island.get("bbox_center", island.get("center", [0.5, 0.5])))
 
             # UV → image pixel coords (Y-flip)
-            # Center of the island in pixel space
             cx = int(center[0] * img_w)
             cy = int((1.0 - center[1]) * img_h)
 

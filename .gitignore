@@ -4,3 +4,4 @@
 .DS_Store
 .env
 __pycache__
+blender_addon/__pycache__
