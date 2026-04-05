@@ -1,11 +1,12 @@
 """
 BlenderNanoBanana - UV Layout Capture
 
-Exports the active mesh's UV layout as a PNG image so it can be sent to Gemini
-as additional visual context (alongside the viewport screenshot).
+Exports the active mesh's UV layout as a PNG wireframe and optionally stamps
+each UV island with a small ID label (e.g. "uv_025") so that Gemini Image
+can correlate the visual island positions on the wireframe with the material
+assignments described in the text prompt ("uv_025=Metal, uv_013=Skin, ...").
 
-Optionally annotates the exported image with island ID labels + material tags
-at each island's UV centroid (requires Pillow; gracefully skipped if not installed).
+Only island IDs are drawn — no colors, no material tags, no debug overlay.
 
 Must be called on Blender's main thread — uses bpy operators.
 """
@@ -216,3 +217,72 @@ def _text_width(draw, text: str, font) -> int:
         # Older Pillow: textsize
         w, _ = draw.textsize(text, font=font)
         return w
+
+
+def annotate_uv_with_ids(
+    image_path: str,
+    islands: List[Dict],
+) -> bool:
+    """
+    Stamp each UV island with ONLY its short ID label (e.g. "uv_025").
+
+    No colors. No material tags. No polygon fills. No debug boxes.
+    Just a small white text label at each island's centroid so that Gemini
+    can match the label to the mesh region when it reads the text prompt
+    ("uv_025=Metal, uv_013=Skin, ...").
+
+    Args:
+        image_path: Path to the UV wireframe PNG (modified in-place).
+        islands:    Island list from nb_uv_analysis["islands"].
+
+    Returns True on success, False if Pillow unavailable or error.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        log_debug("Pillow not available — UV ID annotation skipped.", _MODULE)
+        return False
+
+    try:
+        img = Image.open(image_path).convert("RGBA")
+        draw = ImageDraw.Draw(img)
+        img_w, img_h = img.size
+
+        # Small but legible font
+        try:
+            font = ImageFont.truetype("arial.ttf", 11)
+        except Exception:
+            font = ImageFont.load_default()
+
+        for island in islands:
+            iid    = island.get("id", "?")
+            center = island.get("center", [0.5, 0.5])
+
+            # UV → image pixel coords (Y-flip)
+            # Center of the island in pixel space
+            cx = int(center[0] * img_w)
+            cy = int((1.0 - center[1]) * img_h)
+
+            tw = _text_width(draw, iid, font)
+            th = 11  # approximate text height for small font
+
+            # Center text on the island centroid (not top-left aligned)
+            tx = cx - tw // 2
+            ty = cy - th // 2
+
+            # Tiny semi-transparent black backing so text is readable on white wireframe
+            draw.rectangle(
+                [tx - 2, ty - 1, tx + tw + 2, ty + th + 1],
+                fill=(0, 0, 0, 180),
+            )
+            # White label text, centered on island
+            draw.text((tx, ty), iid, fill=(255, 255, 255, 255), font=font)
+
+        img.save(image_path, "PNG")
+        log_debug(f"UV layout stamped with {len(islands)} ID label(s).", _MODULE)
+        return True
+
+    except Exception as e:
+        log_error(f"UV ID annotation failed: {e}", _MODULE, e)
+        return False
+

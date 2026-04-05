@@ -1,23 +1,28 @@
 """
-BlenderNanoBanana - Texture Generation Pipeline (pure Python)
+BlenderNanoBanana - Texture Generation Pipeline (Single-Call UV Atlas Mode)
 
-Flow:
-  1. Load engine preset
-  2. Visual context (viewport screenshot + UV layout PNG)
-     — UV layout is already annotated with island IDs and material tags
-  3. Gemini Flash: prompt + annotated UV image → JSON material spec
-  4. Gemini Image API: JSON spec + UV layout + viewport → texture maps
-  5. Save to cache
+The CORRECT and CHEAP approach:
+  - Send ONE clean UV wireframe image to Gemini
+  - Describe each island's material in the text prompt
+  - Gemini generates the complete UV atlas in ONE call per map type
+  - Total API calls = number of enabled maps (e.g. 5 maps = 5 calls)
+  - No compositing, no per-tag loops, no post-processing
+
+Cost comparison for 29 UV islands, 3 tags, 5 maps:
+  Old (per-tag):   3 × 5 = 15 calls
+  Old (per-island): 29 × 5 = 145 calls
+  NEW (per-map):   5 calls  ← this file
 """
 
 import os
+import base64
 import threading
+import concurrent.futures
 from typing import Optional, Dict, List, Callable
 
-from .prompt_engineer import get_spec_from_prompt
 from .cache_manager import save_texture_version, get_cache_base_path, get_project_name
-from ..api.google_vision import generate_textures
-from ..utils.image_processing import base64_to_file, image_to_base64
+from ..api.google_vision import generate_uv_atlas_map
+from ..utils.image_processing import base64_to_file
 from ..utils.logging import log_info, log_debug, log_error
 from ..config.engine_presets import ENGINE_PRESETS
 
@@ -40,11 +45,19 @@ def run_generation_pipeline(
     progress_cb: Optional[Callable[[float, str], None]] = None,
     viewport_path: Optional[str] = None,
     uv_layout_path: Optional[str] = None,
+    island_data: Optional[List[Dict]] = None,
+    island_tags: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, str]]:
     """
-    Generate PBR texture maps from a text prompt + visual context.
+    Generate a full UV atlas texture set with ONE Gemini call per map type.
 
-    Returns dict of map_name → saved file path, or None on failure/cancel.
+    Args:
+        prompt:       User's base description (e.g. "Soviet soldier")
+        island_tags:  {island_id: "Metal"} — the per-island material assignments
+        island_data:  UV island list from nb_uv_analysis (for position descriptions)
+        uv_layout_path: Path to the clean UV wireframe PNG (sent to Gemini)
+
+    Returns: {map_name: file_path} or None on failure.
     """
     _cancel_flag.clear()
 
@@ -53,47 +66,12 @@ def run_generation_pipeline(
         if progress_cb:
             progress_cb(frac, msg)
 
-    def _cancelled() -> bool:
-        if _cancel_flag.is_set():
-            _p(0.0, "Cancelled.")
-            return True
-        return False
-
     # ── 1. Engine preset ──────────────────────────────────────────────────────
     _p(0.0, "Loading engine preset...")
     engine_spec = ENGINE_PRESETS.get(engine_id)
     if engine_spec is None:
         log_error(f"Unknown engine preset: '{engine_id}'", _MODULE)
         return None
-    engine_spec = _apply_enabled_maps(engine_spec, enabled_maps)
-
-    if _cancelled(): return None
-
-    # ── 2. Visual context ─────────────────────────────────────────────────────
-    _p(0.05, "Loading visual context...")
-    viewport_b64  = image_to_base64(viewport_path)  if viewport_path  else None
-    uv_layout_b64 = image_to_base64(uv_layout_path) if uv_layout_path else None
-
-    if _cancelled(): return None
-
-    # ── 3. Gemini Flash: prompt + annotated UV image → JSON material spec ─────
-    # The UV layout image already has island IDs and material tags drawn on it.
-    _p(0.12, "Generating material spec...")
-    spec = get_spec_from_prompt(
-        api_key=api_key,
-        user_prompt=prompt,
-        viewport_image_path=viewport_path,
-        uv_layout_path=uv_layout_path,
-    )
-    if spec is None:
-        raise RuntimeError(
-            "Material spec failed — check your Google API key in Addon Preferences."
-        )
-
-    if _cancelled(): return None
-
-    # ── 4. Gemini Image API → texture maps ────────────────────────────────────
-    _p(0.25, f"Generating {len(enabled_maps)} map(s)...")
 
     engine_map_specs = {
         name: {
@@ -105,48 +83,79 @@ def run_generation_pipeline(
         if name in enabled_maps
     }
 
-    # UV layout first (model should see the UV structure before the viewport)
-    visual_context = []
-    if uv_layout_b64: visual_context.append(uv_layout_b64)
-    if viewport_b64:  visual_context.append(viewport_b64)
+    # ── 2. Build island material description ──────────────────────────────────
+    _p(0.02, "Building island descriptions...")
+    island_material_desc = _build_island_desc(island_data or [], island_tags or {})
+    log_info(f"Island material description: {island_material_desc[:200]}", _MODULE)
 
-    def _map_p(frac: float, msg: str):
-        _p(0.25 + frac * 0.65, msg)
+    # ── 3. Load UV wireframe (clean, no annotation) ───────────────────────────
+    _p(0.04, "Loading UV layout...")
+    uv_wireframe_b64 = _load_and_compress_uv(uv_layout_path)
 
-    api_response = generate_textures(
-        api_key=api_key,
-        json_spec=spec,
-        maps_to_generate=enabled_maps,
-        engine_specs=engine_map_specs,
-        visual_context_b64=visual_context or None,
-        progress_cb=_map_p,
-        cancel_flag=_cancel_flag,
-    )
+    if _cancel_flag.is_set():
+        return None
 
-    if _cancelled(): return None
-    if api_response is None:
-        raise RuntimeError(
-            "Gemini Image API returned no image. "
-            "The model may have blocked the request or the API quota is exceeded."
-        )
+    # ── 4. Generate ALL maps in parallel (one API call each) ─────────────────
+    total_maps = len(enabled_maps)
+    completed = 0
+    completed_lock = threading.Lock()
 
-    # ── 6. Save maps ──────────────────────────────────────────────────────────
-    _p(0.92, "Saving maps...")
-    project_name = get_project_name(context)
-    saved = _save_maps(
-        context=context,
-        maps_response=api_response.get("maps", {}),
-        engine_map_specs=engine_map_specs,
-        uv_region_id=uv_region_id,
-        project_name=project_name,
-    )
+    _p(0.06, f"Generating {total_maps} UV atlas maps in parallel...")
+
+    results: Dict[str, str] = {}  # map_name → base64
+
+    def gen_map(map_name: str):
+        if _cancel_flag.is_set():
+            return map_name, None, None
+        try:
+            image_b64, mime = generate_uv_atlas_map(
+                api_key=api_key,
+                map_name=map_name,
+                base_prompt=prompt,
+                island_material_desc=island_material_desc,
+                uv_wireframe_b64=uv_wireframe_b64,
+                map_cfg=engine_map_specs.get(map_name, {}),
+            )
+            return map_name, image_b64, None
+        except Exception as e:
+            return map_name, None, e
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(total_maps, 8)) as exc:
+        futures = {exc.submit(gen_map, m): m for m in enabled_maps}
+        for future in concurrent.futures.as_completed(futures):
+            map_name, b64, err = future.result()
+            with completed_lock:
+                completed += 1
+                frac = 0.06 + (completed / total_maps) * 0.84
+            if err:
+                log_error(f"Failed [{map_name}]: {err}", _MODULE)
+                _p(frac, f"✗ {map_name}")
+            elif b64:
+                results[map_name] = b64
+                _p(frac, f"✓ {map_name} ({completed}/{total_maps})")
+
+    if _cancel_flag.is_set():
+        return None
+
+    if not results:
+        raise RuntimeError("Gemini Image API returned no images for any map type.")
+
+    # ── 5. Save maps ──────────────────────────────────────────────────────────
+    _p(0.91, "Saving maps...")
+    out_dir = _output_dir(context, get_project_name(context), uv_region_id)
+    os.makedirs(out_dir, exist_ok=True)
+    saved: Dict[str, str] = {}
+
+    for map_name, b64 in results.items():
+        ext  = engine_map_specs.get(map_name, {}).get("file_ext", "png")
+        path = os.path.join(out_dir, f"{map_name}.{ext}")
+        if base64_to_file(b64, path):
+            saved[map_name] = path
+
     if not saved:
-        raise RuntimeError(
-            "Maps were generated but could not be saved to disk. "
-            "Check cache path in Addon Preferences."
-        )
+        raise RuntimeError("Maps generated but could not be saved to disk.")
 
-    # ── 7. Cache version entry ────────────────────────────────────────────────
+    # ── 6. Cache entry ─────────────────────────────────────────────────────────
     _p(0.97, "Saving to cache...")
     save_texture_version(
         context=context,
@@ -156,7 +165,7 @@ def run_generation_pipeline(
             "prompt": prompt,
             "engine_id": engine_id,
             "maps": enabled_maps,
-            "gemini_spec": spec,
+            "island_material_desc": island_material_desc,
         },
     )
 
@@ -165,35 +174,67 @@ def run_generation_pipeline(
     return saved
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _apply_enabled_maps(engine_spec: dict, enabled_maps: List[str]) -> dict:
-    import copy
-    spec = copy.deepcopy(engine_spec)
-    for name, cfg in spec["supported_maps"].items():
-        cfg["enabled"] = name in enabled_maps
-    return spec
+def _build_island_desc(island_data: List[Dict], island_tags: Dict[str, str]) -> str:
+    """
+    Build a concise human-readable description of each UV island and its material.
 
+    Example output:
+      "uv_001(top-left,small)=Metal; uv_002(center,large)=Skin; uv_003(bottom-right,medium)=Wood"
 
-def _save_maps(
-    context,
-    maps_response: dict,
-    engine_map_specs: dict,
-    uv_region_id: str,
-    project_name: str,
-) -> Dict[str, str]:
-    out_dir = _output_dir(context, project_name, uv_region_id)
-    os.makedirs(out_dir, exist_ok=True)
-    saved = {}
-    for map_name, map_data in maps_response.items():
-        b64 = map_data.get("data") or map_data.get("image_data")
-        if not b64:
+    The position hints help Gemini correlate text descriptions to the UV wireframe.
+    """
+    if not island_data or not island_tags:
+        return ""
+
+    parts = []
+    for island in island_data:
+        iid = island.get("id", "?")
+        tag = island_tags.get(iid)
+        if not tag:
             continue
-        ext  = engine_map_specs.get(map_name, {}).get("file_ext", "png")
-        path = os.path.join(out_dir, f"{map_name}.{ext}")
-        if base64_to_file(b64, path):
-            saved[map_name] = path
-    return saved
+
+        bounds = island.get("bounds", {})
+        min_u, min_v = bounds.get("min", [0.5, 0.5])
+        max_u, max_v = bounds.get("max", [0.5, 0.5])
+        cu = (min_u + max_u) / 2
+        cv = (min_v + max_v) / 2
+        area = island.get("area", 0.0)
+
+        # Human-readable position
+        h = "left" if cu < 0.35 else ("right" if cu > 0.65 else "center")
+        v = "top"  if cv > 0.65 else ("bottom" if cv < 0.35 else "middle")
+        size = "small" if area < 0.01 else ("large" if area > 0.08 else "medium")
+
+        parts.append(f"{iid}({v}-{h},{size})={tag}")
+
+    return "; ".join(parts)
+
+
+def _load_and_compress_uv(uv_layout_path: Optional[str]) -> Optional[str]:
+    """
+    Load the UV layout PNG, compress to 768px JPEG for fast upload.
+    Returns base64 string or None.
+    """
+    if not uv_layout_path or not os.path.isfile(uv_layout_path):
+        return None
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(uv_layout_path).convert("RGB")
+        img.thumbnail((768, 768))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        log_error(f"UV layout compression failed: {e}", _MODULE)
+        # Fallback: raw file
+        try:
+            with open(uv_layout_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        except Exception:
+            return None
 
 
 def _output_dir(context, project_name: str, uv_region_id: str) -> str:

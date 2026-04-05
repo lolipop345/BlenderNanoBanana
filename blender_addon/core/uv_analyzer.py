@@ -97,7 +97,12 @@ def _detect_islands_bmesh(obj) -> Dict[str, Any]:
             min_v = min(u.y for u in uvs)
             max_v = max(u.y for u in uvs)
             area = (max_u - min_u) * (max_v - min_v)
-            center = [(min_u + max_u) / 2, (min_v + max_v) / 2]
+            # Use actual UV vertex average (true centroid), not bounding-box midpoint.
+            # Bounding-box midpoint often falls outside the island for complex shapes.
+            center = [
+                sum(u.x for u in uvs) / len(uvs),
+                sum(u.y for u in uvs) / len(uvs),
+            ]
         else:
             min_u = min_v = max_u = max_v = 0.0
             area = 0.0

@@ -51,19 +51,18 @@ def _make_client(api_key: str, timeout_sec: int):
     """
     Create a genai.Client and apply three patches to prevent WriteTimeout:
 
-    1. patch _httpx_client._timeout     → unlimited write/read/pool, 60s connect
-    2. patch _async_httpx_client._timeout → same
-    3. patch _http_options.timeout = None → SDK passes timeout=None to httpx.send(),
-       which then falls back to _timeout (our unlimited value) instead of
-       passing timeout=120 which would override our patch.
+    1. patch _httpx_client._timeout
+    2. patch _async_httpx_client._timeout
+    3. patch _http_options.timeout = None
 
-    Confirmed working in Blender 4.5 LTS + google-genai 1.70.0 + httpx 0.28.1.
+    Using 300s for write/read instead of None to prevent infinite hangs if the
+    API server fails to respond.
     """
     from google import genai
     import httpx
 
-    # connect=60s, write/read/pool = unlimited (None)
-    hx_no_timeout = httpx.Timeout(timeout=None, connect=60.0)
+    # connect=60s, write/read/pool = 300s (prevent 40-minute infinite hangs)
+    hx_no_timeout = httpx.Timeout(timeout=300.0, connect=60.0)
 
     client = genai.Client(api_key=api_key, http_options={"timeout": timeout_sec})
 

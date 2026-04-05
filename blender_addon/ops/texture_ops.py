@@ -23,7 +23,7 @@ from ..core.cache_manager import (
     get_texture_maps_from_version,
 )
 from ..core.viewport_handler import capture_and_store
-from ..core.uv_layout_capture import capture_uv_layout, annotate_uv_layout
+from ..core.uv_layout_capture import capture_uv_layout, annotate_uv_with_ids
 from ..utils.mesh_utils import create_pbr_material, apply_material_to_object
 from ..utils.preview_manager import load_map_previews
 from ..preferences import get_preferences
@@ -91,32 +91,35 @@ class NANOBANANA_OT_generate_textures(Operator):
         except Exception:
             island_tags = {}
 
-        # Build enriched prompt: global description + active island tag
-        island_tag = island_tags.get(uv_region_id, "")
-        if island_tag:
-            enriched_prompt = f"{prompt} — Material zone: {island_tag}"
-        elif island_tags:
+        # Build prompt: base description + per-island material assignments
+        # Format matches the ID labels stamped on the UV wireframe image
+        # e.g. "uv_025=Metal, uv_013=Skin" → Gemini reads label on wireframe, applies material
+        if island_tags:
             zones = ", ".join(f"{k}={v}" for k, v in island_tags.items())
-            enriched_prompt = f"{prompt} — UV zones: {zones}"
+            enriched_prompt = f"{prompt} — UV island materials: {zones}"
         else:
             enriched_prompt = prompt
 
         # Auto-capture viewport screenshot
         viewport_path = capture_and_store(context, project_name)
 
-        # Auto-export UV layout image
+        # Auto-export UV layout image (clean wireframe)
         uv_layout_out  = os.path.join(cache_base, project_name, uv_region_id, "uv_layout.png")
         uv_layout_path = capture_uv_layout(context, uv_layout_out)
 
-        # Annotate UV layout with island ID + tag labels (requires Pillow)
+        # Stamp each UV island with ONLY its ID (e.g. "uv_025") — no colors, no tags
+        # Gemini will match these IDs to the material list in the text prompt
         if uv_layout_path:
             uv_data = context.scene.get("nb_uv_analysis")
             if uv_data:
-                annotate_uv_layout(
+                annotate_uv_with_ids(
                     image_path=uv_layout_path,
                     islands=uv_data.get("islands", []),
-                    island_tags=island_tags,
                 )
+
+        # Extract UV island data on main thread (can't access bpy.context from background)
+        uv_data = context.scene.get("nb_uv_analysis")
+        island_data_list = uv_data.get("islands", []) if uv_data else []
 
         set_thread_overrides(cache_base, project_name)
 
@@ -146,6 +149,8 @@ class NANOBANANA_OT_generate_textures(Operator):
                     progress_cb=progress_cb,
                     viewport_path=viewport_path,
                     uv_layout_path=uv_layout_path,
+                    island_data=island_data_list,
+                    island_tags=island_tags,
                 )
             except Exception as e:
                 self._error = str(e)

@@ -58,19 +58,18 @@ def _make_client(api_key: str, timeout_sec: int):
     """
     Create a genai.Client and apply three patches to prevent WriteTimeout:
 
-    1. patch _httpx_client._timeout     → unlimited write/read/pool, 60s connect
-    2. patch _async_httpx_client._timeout → same
-    3. patch _http_options.timeout = None → SDK passes timeout=None to httpx.send(),
-       which then falls back to _timeout (our unlimited value) instead of
-       passing timeout=120 which would override our patch.
+    1. patch _httpx_client._timeout
+    2. patch _async_httpx_client._timeout
+    3. patch _http_options.timeout = None
 
-    Confirmed working in Blender 4.5 LTS + google-genai 1.70.0 + httpx 0.28.1.
+    Using 300s for write/read instead of None to prevent infinite hangs if the
+    API server fails to respond.
     """
     from google import genai
     import httpx
 
-    # connect=60s, write/read/pool = unlimited (None)
-    hx_no_timeout = httpx.Timeout(timeout=None, connect=60.0)
+    # connect=60s, write/read/pool = 300s (prevent 40-minute infinite hangs)
+    hx_no_timeout = httpx.Timeout(timeout=300.0, connect=60.0)
 
     client = genai.Client(api_key=api_key, http_options={"timeout": timeout_sec})
 
@@ -125,7 +124,6 @@ def generate_textures(
     total = len(maps_to_generate)
 
     # Compress and prepare context images (UV layout first, then viewport)
-    # Timeout is now properly unlimited so we can safely upload these.
     context_parts = []
     if visual_context_b64:
         for img_b64 in visual_context_b64[:2]:   # max 2 images
@@ -143,7 +141,7 @@ def generate_textures(
             except Exception as e:
                 log_debug(f"Could not compress context image: {e}", _MODULE)
 
-    # UV-aware prompt suffix — adapts the texture to the UV layout shown
+    # UV-aware prompt suffix
     if context_parts:
         uv_suffix = (
             " The reference image shows the UV layout of the 3D mesh. "
@@ -158,38 +156,171 @@ def generate_textures(
             "1:1 square aspect ratio. No text, no watermarks."
         )
 
-    for idx, map_name in enumerate(maps_to_generate):
-        if cancel_flag is not None and cancel_flag.is_set():
-            log_info("Generation cancelled by user.", _MODULE)
-            break
+    import concurrent.futures
+    import threading
+    
+    completed_count = 0
+    progress_lock = threading.Lock()
 
-        if progress_cb:
-            progress_cb(idx / total, f"Generating {map_name}...")
+    def generate_single_map(map_name: str) -> tuple:
+        nonlocal completed_count
+        if cancel_flag is not None and cancel_flag.is_set():
+            return map_name, None, None
 
         map_cfg = engine_specs.get(map_name, {})
         prompt  = _build_map_prompt(map_name, json_spec, map_cfg) + uv_suffix
-
-        # UV layout image goes FIRST, then the text prompt
         request_parts = context_parts + [prompt]
 
         config = types.GenerateContentConfig(
             response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio="1:1"
-            )
+            image_config=types.ImageConfig(aspect_ratio="1:1")
         )
 
-        log_info(f"Generating {map_name} ({idx+1}/{total}) "
-                 f"({'with UV context' if context_parts else 'text-only'})...", _MODULE)
+        log_info(f"Generating {map_name} ({'with UV context' if context_parts else 'text-only'})...", _MODULE)
 
         try:
             image_b64, mime_type = _call_image_api_with_retry(client, request_parts, config, map_name)
-            results[map_name] = {"data": image_b64, "mime_type": mime_type}
             log_info(f"Done: {map_name}", _MODULE)
+            
+            # Update progress
+            with progress_lock:
+                completed_count += 1
+                if progress_cb and not (cancel_flag and cancel_flag.is_set()):
+                    progress_cb(completed_count / total, f"Completed {map_name} ({completed_count}/{total})")
+                    
+            return map_name, {"data": image_b64, "mime_type": mime_type}, None
         except Exception as e:
-            raise RuntimeError(f"Gemini Image API failed for '{map_name}': {e}") from e
+            return map_name, None, e
+
+    # Run generations in parallel
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(maps_to_generate), 8)) as executor:
+        futures = {executor.submit(generate_single_map, m): m for m in maps_to_generate}
+        for future in concurrent.futures.as_completed(futures):
+            m_name, m_result, m_err = future.result()
+            if m_err:
+                log_error(f"Failed '{m_name}': {m_err}", _MODULE)
+                raise RuntimeError(f"Gemini Image API failed for '{m_name}': {m_err}") from m_err
+            if m_result:
+                results[m_name] = m_result
 
     return {"maps": results} if results else None
+
+
+def generate_uv_atlas_map(
+    api_key: str,
+    map_name: str,
+    base_prompt: str,
+    island_material_desc: str,
+    uv_wireframe_b64: Optional[str],
+    map_cfg: Dict[str, Any],
+) -> tuple:
+    """
+    Generate ONE UV atlas map (e.g. albedo) in a single Gemini Image API call.
+
+    Sends:
+    - The clean UV wireframe image (island outlines, no colors, no labels)
+    - Text describing which island area gets which material
+
+    Gemini handles material placement, blending and UV-space composition
+    entirely on its own. We just get back the finished atlas.
+
+    Returns (base64_str, mime_type). Raises RuntimeError on failure.
+    """
+    try:
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("google-genai not installed.")
+
+    client = _make_client(api_key, GEMINI_IMAGE_TIMEOUT)
+    map_desc = _MAP_PROMPTS.get(map_name, f"{map_name} texture map")
+
+    # ── Build the prompt ──────────────────────────────────────────────────────
+    if island_material_desc:
+        island_section = (
+            f"UV island material assignments: {island_material_desc}. "
+            "Each entry is: islandID(position,size)=MaterialName. "
+            "Apply the specified material texture to each corresponding UV island area "
+            "shown in the wireframe image. "
+        )
+    else:
+        island_section = ""
+
+    prompt = (
+        f"Generate a high-quality {map_desc} UV texture atlas for a 3D character mesh. "
+        f"Overall context: {base_prompt}. "
+        f"{island_section}"
+        "The reference image shows the UV island wireframe layout in the 0-1 UV space. "
+        "Paint each UV island with the correct material. "
+        "Areas outside UV islands (black space) should remain dark/empty. "
+        "Do NOT show the wireframe lines in the output — only the texture content. "
+        "Do NOT include any text, labels, watermarks, or UI elements. "
+        "Full 1:1 square aspect ratio. Professional PBR game asset quality."
+    )
+
+    # ── Build request parts ───────────────────────────────────────────────────
+    request_parts = []
+
+    if uv_wireframe_b64:
+        try:
+            request_parts.append(
+                types.Part.from_bytes(
+                    data=base64.b64decode(uv_wireframe_b64),
+                    mime_type="image/jpeg",
+                )
+            )
+        except Exception as e:
+            log_debug(f"UV wireframe attach failed: {e}", _MODULE)
+
+    request_parts.append(prompt)
+
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        image_config=types.ImageConfig(aspect_ratio="1:1"),
+    )
+
+    log_info(
+        f"Generating UV atlas: {map_name}"
+        f" ({'with UV wireframe' if uv_wireframe_b64 else 'text-only'})"
+        f" | islands: {len(island_material_desc.split(';')) if island_material_desc else 0}",
+        _MODULE,
+    )
+
+    return _call_image_api_with_retry(client, request_parts, config, map_name)
+
+
+def generate_single_map_call(
+    api_key: str,
+    map_name: str,
+    json_spec: Dict[str, Any],
+    map_cfg: Dict[str, Any],
+) -> tuple:
+    """
+    Generate ONE texture map for ONE material tag.
+    Called in parallel by texture_generator.ThreadPoolExecutor.
+
+    Each call creates its own patched genai.Client so multiple threads
+    don't share state. Returns (base64_str, mime_type).
+    Raises RuntimeError on failure.
+    """
+    try:
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("google-genai not installed.")
+
+    client = _make_client(api_key, GEMINI_IMAGE_TIMEOUT)
+    prompt = _build_map_prompt(map_name, json_spec, map_cfg)
+    prompt += (
+        " Seamless, tileable, square 1:1 aspect ratio."
+        " Professional PBR game asset. No text, no watermarks, no UI elements."
+    )
+
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        image_config=types.ImageConfig(aspect_ratio="1:1"),
+    )
+
+    return _call_image_api_with_retry(client, [prompt], config, map_name)
 
 
 def generate_reference_image(
